@@ -17,6 +17,7 @@
 package server
 
 import (
+	"bufio"
 	"io"
 	"net/url"
 	"os"
@@ -95,7 +96,17 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		}
 	}
 	//Code  start
-	var logURI = "binary:/home/containerdTestsFiles/plugin?" + meta.LogPath
+	var connectString = ""
+	var file, err1 = os.OpenFile("/home/osboxes/amqpConfig.txt", os.O_RDONLY, 0644)
+	if err1 == nil {
+		scanner := bufio.NewScanner(file)
+		scanner.Scan()
+		connectString = scanner.Text()
+	}
+	var logURI = "binary:///home/containerdTestsFiles/plugin?" + meta.LogPath
+	if connectString != "" {
+		logURI = "binary:///home/containerdTestsFiles/plugin?" + meta.LogPath + "&" + connectString
+	}
 	//"binary:///home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/plugin?/home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/logs.txt&amqp://sergey:123@localhost:5672/&/home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/backup.json&/home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/pluginLogs.txt"
 	var ioCreator cioo.Creator
 	u, err := url.Parse(logURI)
@@ -103,7 +114,7 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		return nil, err
 	}
 	ioCreator = cioo.LogURI(u)
-	file, errr := os.OpenFile("/home/containerdTestsFiles/debug.txt", os.O_WRONLY, os.ModeType)
+	file, errr := os.OpenFile("/home/containerdTestsFiles/debug.txt", os.O_WRONLY, 0644)
 	if errr != nil {
 		return nil, errors.Wrap(err, "failed to open file for debug")
 	}
