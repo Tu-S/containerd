@@ -55,6 +55,7 @@ func NewCRILogger(path string, w io.Writer, stream StreamType, maxLen int) (io.W
 	prc, pwc := io.Pipe()
 	stop := make(chan struct{})
 	go func() {
+		///FQW2 prc чтение из трубы
 		redirectLogs(path, prc, w, stream, maxLen)
 		close(stop)
 	}()
@@ -112,6 +113,7 @@ func readLine(b *bufio.Reader) (line []byte, isPrefix bool, err error) {
 }
 
 func redirectLogs(path string, rc io.ReadCloser, w io.Writer, s StreamType, maxLen int) {
+	//FQW2 сюда подсунуть свою реализацию Write и вроде как профит
 	defer rc.Close()
 	var (
 		stream    = []byte(s)
