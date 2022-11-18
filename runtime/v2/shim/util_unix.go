@@ -26,15 +26,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/pkg/dialer"
 	"github.com/containerd/containerd/sys"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -55,11 +54,11 @@ func AdjustOOMScore(pid int) error {
 	parent := os.Getppid()
 	score, err := sys.GetOOMScoreAdj(parent)
 	if err != nil {
-		return errors.Wrap(err, "get parent OOM score")
+		return fmt.Errorf("get parent OOM score: %w", err)
 	}
 	shimScore := score + 1
 	if err := sys.AdjustOOMScore(pid, shimScore); err != nil {
-		return errors.Wrap(err, "set shim OOM score")
+		return fmt.Errorf("set shim OOM score: %w", err)
 	}
 	return nil
 }
@@ -78,9 +77,7 @@ func SocketAddress(ctx context.Context, socketPath, id string) (string, error) {
 
 // AnonDialer returns a dialer for a socket
 func AnonDialer(address string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return dialer.ContextDialer(ctx, socket(address).path())
+	return net.DialTimeout("unix", socket(address).path(), timeout)
 }
 
 // AnonReconnectDialer returns a dialer for an existing socket on reconnection
@@ -91,15 +88,20 @@ func AnonReconnectDialer(address string, timeout time.Duration) (net.Conn, error
 // NewSocket returns a new socket
 func NewSocket(address string) (*net.UnixListener, error) {
 	var (
-		sock = socket(address)
-		path = sock.path()
+		sock       = socket(address)
+		path       = sock.path()
+		isAbstract = sock.isAbstract()
+		perm       = os.FileMode(0600)
 	)
 
-	isAbstract := sock.isAbstract()
+	// Darwin needs +x to access socket, otherwise it'll fail with "bind: permission denied" when running as non-root.
+	if runtime.GOOS == "darwin" {
+		perm = 0700
+	}
 
 	if !isAbstract {
-		if err := os.MkdirAll(filepath.Dir(path), 0600); err != nil {
-			return nil, errors.Wrapf(err, "%s", path)
+		if err := os.MkdirAll(filepath.Dir(path), perm); err != nil {
+			return nil, fmt.Errorf("mkdir failed for %s: %w", path, err)
 		}
 	}
 	l, err := net.Listen("unix", path)
@@ -108,12 +110,13 @@ func NewSocket(address string) (*net.UnixListener, error) {
 	}
 
 	if !isAbstract {
-		if err := os.Chmod(path, 0600); err != nil {
+		if err := os.Chmod(path, perm); err != nil {
 			os.Remove(sock.path())
 			l.Close()
-			return nil, err
+			return nil, fmt.Errorf("chmod failed for %s: %w", path, err)
 		}
 	}
+
 	return l.(*net.UnixListener), nil
 }
 

@@ -18,6 +18,8 @@ package opts
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,26 +27,10 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/oci"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	osinterface "github.com/containerd/containerd/pkg/os"
 )
-
-// WithWindowsNetworkNamespace sets windows network namespace for container.
-// TODO(windows): Move this into container/containerd.
-func WithWindowsNetworkNamespace(path string) oci.SpecOpts {
-	return func(ctx context.Context, client oci.Client, c *containers.Container, s *runtimespec.Spec) error {
-		if s.Windows == nil {
-			s.Windows = &runtimespec.Windows{}
-		}
-		if s.Windows.Network == nil {
-			s.Windows.Network = &runtimespec.WindowsNetwork{}
-		}
-		s.Windows.Network.NetworkNamespace = path
-		return nil
-	}
-}
 
 // namedPipePath returns true if the given path is to a named pipe.
 func namedPipePath(p string) bool {
@@ -58,6 +44,61 @@ func cleanMount(p string) string {
 		return p
 	}
 	return filepath.Clean(p)
+}
+
+func parseMount(osi osinterface.OS, mount *runtime.Mount) (*runtimespec.Mount, error) {
+	var (
+		dst = mount.GetContainerPath()
+		src = mount.GetHostPath()
+	)
+	// In the case of a named pipe mount on Windows, don't stat the file
+	// or do other operations that open it, as that could interfere with
+	// the listening process. filepath.Clean also breaks named pipe
+	// paths, so don't use it.
+	if !namedPipePath(src) {
+		if _, err := osi.Stat(src); err != nil {
+			// Create the host path if it doesn't exist. This will align
+			// the behavior with the Linux implementation, but it doesn't
+			// align with Docker's behavior on Windows.
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("failed to stat %q: %w", src, err)
+			}
+			if err := osi.MkdirAll(src, 0755); err != nil {
+				return nil, fmt.Errorf("failed to mkdir %q: %w", src, err)
+			}
+		}
+		var err error
+		src, err = osi.ResolveSymbolicLink(src)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve symlink %q: %w", src, err)
+		}
+		// hcsshim requires clean path, especially '/' -> '\'. Additionally,
+		// for the destination, absolute paths should have the C: prefix.
+		src = filepath.Clean(src)
+
+		// filepath.Clean adds a '.' at the end if the path is a
+		// drive (like Z:, E: etc.). Keeping this '.' in the path
+		// causes incorrect parameter error when starting the
+		// container on windows.  Remove it here.
+		if !(len(dst) == 2 && dst[1] == ':') {
+			dst = filepath.Clean(dst)
+			if dst[0] == '\\' {
+				dst = "C:" + dst
+			}
+		} else if dst[0] == 'c' || dst[0] == 'C' {
+			return nil, fmt.Errorf("destination path can not be C drive")
+		}
+	}
+
+	var options []string
+	// NOTE(random-liu): we don't change all mounts to `ro` when root filesystem
+	// is readonly. This is different from docker's behavior, but make more sense.
+	if mount.GetReadonly() {
+		options = append(options, "ro")
+	} else {
+		options = append(options, "rw")
+	}
+	return &runtimespec.Mount{Source: src, Destination: dst, Options: options}, nil
 }
 
 // WithWindowsMounts sorts and adds runtime and CRI mounts to the spec for
@@ -109,44 +150,11 @@ func WithWindowsMounts(osi osinterface.OS, config *runtime.ContainerConfig, extr
 		}
 
 		for _, mount := range mounts {
-			var (
-				dst = mount.GetContainerPath()
-				src = mount.GetHostPath()
-			)
-			// In the case of a named pipe mount on Windows, don't stat the file
-			// or do other operations that open it, as that could interfere with
-			// the listening process. filepath.Clean also breaks named pipe
-			// paths, so don't use it.
-			if !namedPipePath(src) {
-				if _, err := osi.Stat(src); err != nil {
-					// If the source doesn't exist, return an error instead
-					// of creating the source. This aligns with Docker's
-					// behavior on windows.
-					return errors.Wrapf(err, "failed to stat %q", src)
-				}
-				var err error
-				src, err = osi.ResolveSymbolicLink(src)
-				if err != nil {
-					return errors.Wrapf(err, "failed to resolve symlink %q", src)
-				}
-				// hcsshim requires clean path, especially '/' -> '\'.
-				src = filepath.Clean(src)
-				dst = filepath.Clean(dst)
+			parsedMount, err := parseMount(osi, mount)
+			if err != nil {
+				return err
 			}
-
-			var options []string
-			// NOTE(random-liu): we don't change all mounts to `ro` when root filesystem
-			// is readonly. This is different from docker's behavior, but make more sense.
-			if mount.GetReadonly() {
-				options = append(options, "ro")
-			} else {
-				options = append(options, "rw")
-			}
-			s.Mounts = append(s.Mounts, runtimespec.Mount{
-				Source:      src,
-				Destination: dst,
-				Options:     options,
-			})
+			s.Mounts = append(s.Mounts, *parsedMount)
 		}
 		return nil
 	}
@@ -164,9 +172,6 @@ func WithWindowsResources(resources *runtime.WindowsContainerResources) oci.Spec
 		if s.Windows.Resources == nil {
 			s.Windows.Resources = &runtimespec.WindowsResources{}
 		}
-		if s.Windows.Resources.CPU == nil {
-			s.Windows.Resources.CPU = &runtimespec.WindowsCPUResources{}
-		}
 		if s.Windows.Resources.Memory == nil {
 			s.Windows.Resources.Memory = &runtimespec.WindowsMemoryResources{}
 		}
@@ -177,6 +182,9 @@ func WithWindowsResources(resources *runtime.WindowsContainerResources) oci.Spec
 			max    = uint16(resources.GetCpuMaximum())
 			limit  = uint64(resources.GetMemoryLimitInBytes())
 		)
+		if s.Windows.Resources.CPU == nil && (count != 0 || shares != 0 || max != 0) {
+			s.Windows.Resources.CPU = &runtimespec.WindowsCPUResources{}
+		}
 		if count != 0 {
 			s.Windows.Resources.CPU.Count = &count
 		}
@@ -217,6 +225,37 @@ func WithWindowsCredentialSpec(credentialSpec string) oci.SpecOpts {
 			s.Windows = &runtimespec.Windows{}
 		}
 		s.Windows.CredentialSpec = credentialSpec
+		return nil
+	}
+}
+
+// WithDevices sets the provided devices onto the container spec
+func WithDevices(config *runtime.ContainerConfig) oci.SpecOpts {
+	return func(ctx context.Context, client oci.Client, c *containers.Container, s *runtimespec.Spec) (err error) {
+		for _, device := range config.GetDevices() {
+			if device.ContainerPath != "" {
+				return fmt.Errorf("unexpected ContainerPath %s, must be empty", device.ContainerPath)
+			}
+
+			if device.Permissions != "" {
+				return fmt.Errorf("unexpected Permissions %s, must be empty", device.Permissions)
+			}
+
+			hostPath := device.HostPath
+			if strings.HasPrefix(hostPath, "class/") {
+				hostPath = "class://" + strings.TrimPrefix(hostPath, "class/")
+			}
+
+			idType, id, ok := strings.Cut(hostPath, "://")
+			if !ok {
+				return fmt.Errorf("unrecognised HostPath format %v, must match IDType://ID", device.HostPath)
+			}
+
+			o := oci.WithWindowsDevice(idType, id)
+			if err := o(ctx, client, c, s); err != nil {
+				return fmt.Errorf("failed adding device with HostPath %v: %w", device.HostPath, err)
+			}
+		}
 		return nil
 	}
 }

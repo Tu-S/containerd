@@ -1,3 +1,4 @@
+//go:build gofuzz
 // +build gofuzz
 
 /*
@@ -22,8 +23,7 @@ import (
 	fuzz "github.com/AdaLogics/go-fuzz-headers"
 
 	"github.com/containerd/containerd"
-	_ "github.com/containerd/containerd/cmd/containerd"
-	"github.com/containerd/containerd/cmd/containerd/command"
+	_ "github.com/containerd/containerd/cmd/containerd/builtins"
 	"github.com/containerd/containerd/namespaces"
 )
 
@@ -33,17 +33,6 @@ const (
 	defaultAddress = "/tmp/containerd/containerd.sock"
 )
 
-func init() {
-	args := []string{"--log-level", "debug"}
-	go func() {
-		// This is similar to invoking the
-		// containerd binary.
-		// See contrib/fuzz/oss_fuzz_build.sh
-		// for more info.
-		command.StartDaemonForFuzzing(args)
-	}()
-}
-
 func fuzzContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = namespaces.WithNamespace(ctx, "fuzzing-namespace")
@@ -51,6 +40,8 @@ func fuzzContext() (context.Context, context.CancelFunc) {
 }
 
 func FuzzContainerdImport(data []byte) int {
+	initDaemon.Do(startDaemon)
+
 	client, err := containerd.New(defaultAddress)
 	if err != nil {
 		return 0

@@ -17,9 +17,9 @@
 package run
 
 import (
-	"context"
 	gocontext "context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -29,11 +29,10 @@ import (
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/cmd/ctr/commands/tasks"
 	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/namespaces"
+	clabels "github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/oci"
 	gocni "github.com/containerd/go-cni"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -63,13 +62,11 @@ func parseMountFlag(m string) (specs.Mount, error) {
 	}
 
 	for _, field := range fields {
-		v := strings.SplitN(field, "=", 2)
-		if len(v) < 2 {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok {
 			return mount, fmt.Errorf("invalid mount specification: expected key=val")
 		}
 
-		key := v[0]
-		val := v[1]
 		switch key {
 		case "type":
 			mount.Type = val
@@ -121,6 +118,10 @@ var Command = cli.Command{
 		cli.StringFlag{
 			Name:  "platform",
 			Usage: "run image for specific platform",
+		},
+		cli.BoolFlag{
+			Name:  "cni",
+			Usage: "enable cni networking for the container",
 		},
 	}, append(platformRunFlags,
 		append(append(commands.SnapshotterFlags, []cli.Flag{commands.SnapshotterLabels}...),
@@ -191,7 +192,7 @@ var Command = cli.Command{
 		if !detach {
 			defer func() {
 				if enableCNI {
-					if err := network.Remove(ctx, fullID(ctx, container), ""); err != nil {
+					if err := network.Remove(ctx, commands.FullID(ctx, container), ""); err != nil {
 						logrus.WithError(err).Error("network review")
 					}
 				}
@@ -208,7 +209,12 @@ var Command = cli.Command{
 			}
 		}
 		if enableCNI {
-			if _, err := network.Setup(ctx, fullID(ctx, container), fmt.Sprintf("/proc/%d/ns/net", task.Pid())); err != nil {
+			netNsPath, err := getNetNSPath(ctx, task)
+			if err != nil {
+				return err
+			}
+
+			if _, err := network.Setup(ctx, commands.FullID(ctx, container), netNsPath); err != nil {
 				return err
 			}
 		}
@@ -241,20 +247,17 @@ var Command = cli.Command{
 	},
 }
 
-func fullID(ctx context.Context, c containerd.Container) string {
-	id := c.ID()
-	ns, ok := namespaces.Namespace(ctx)
-	if !ok {
-		return id
-	}
-	return fmt.Sprintf("%s-%s", ns, id)
-}
-
 // buildLabel builds the labels from command line labels and the image labels
 func buildLabels(cmdLabels, imageLabels map[string]string) map[string]string {
 	labels := make(map[string]string)
 	for k, v := range imageLabels {
-		labels[k] = v
+		if err := clabels.Validate(k, v); err == nil {
+			labels[k] = v
+		} else {
+			// In case the image label is invalid, we output a warning and skip adding it to the
+			// container.
+			logrus.WithError(err).Warnf("unable to add image label with key %s to the container", k)
+		}
 	}
 	// labels from the command line will override image and the initial image config labels
 	for k, v := range cmdLabels {

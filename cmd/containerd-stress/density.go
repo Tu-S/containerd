@@ -52,6 +52,7 @@ var densityCommand = cli.Command{
 			Duration:    cliContext.GlobalDuration("duration"),
 			Concurrency: cliContext.GlobalInt("concurrent"),
 			Exec:        cliContext.GlobalBool("exec"),
+			Image:       cliContext.GlobalString("image"),
 			JSON:        cliContext.GlobalBool("json"),
 			Metrics:     cliContext.GlobalString("metrics"),
 			Snapshotter: cliContext.GlobalString("snapshotter"),
@@ -65,8 +66,8 @@ var densityCommand = cli.Command{
 		if err := cleanup(ctx, client); err != nil {
 			return err
 		}
-		logrus.Infof("pulling %s", imageName)
-		image, err := client.Pull(ctx, imageName, containerd.WithPullUnpack, containerd.WithPullSnapshotter(config.Snapshotter))
+		logrus.Infof("pulling %s", config.Image)
+		image, err := client.Pull(ctx, config.Image, containerd.WithPullUnpack, containerd.WithPullSnapshotter(config.Snapshotter))
 		if err != nil {
 			return err
 		}
@@ -75,9 +76,6 @@ var densityCommand = cli.Command{
 		s := make(chan os.Signal, 1)
 		signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
 
-		if err != nil {
-			return err
-		}
 		var (
 			pids  []uint32
 			count = cliContext.Int("count")
@@ -208,13 +206,13 @@ func parseStat(data string) (stat Stat, err error) {
 		return stat, fmt.Errorf("invalid stat data: %q", data)
 	}
 
-	parts := strings.SplitN(data[:i], "(", 2)
-	if len(parts) != 2 {
+	val, name, ok := strings.Cut(data[:i], "(")
+	if !ok {
 		return stat, fmt.Errorf("invalid stat data: %q", data)
 	}
 
-	stat.Name = parts[1]
-	_, err = fmt.Sscanf(parts[0], "%d", &stat.PID)
+	stat.Name = name
+	_, err = fmt.Sscanf(val, "%d", &stat.PID)
 	if err != nil {
 		return stat, err
 	}
@@ -222,7 +220,7 @@ func parseStat(data string) (stat Stat, err error) {
 	// parts indexes should be offset by 3 from the field number given
 	// proc(5), because parts is zero-indexed and we've removed fields
 	// one (PID) and two (Name) in the paren-split.
-	parts = strings.Split(data[i+2:], " ")
+	parts := strings.Split(data[i+2:], " ")
 	fmt.Sscanf(parts[22-3], "%d", &stat.StartTime)
 	fmt.Sscanf(parts[4-3], "%d", &stat.PPID)
 	return stat, nil

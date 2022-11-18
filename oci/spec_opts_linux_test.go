@@ -18,14 +18,200 @@ package oci
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/pkg/testutil"
+	"github.com/containerd/continuity/fs/fstest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+//nolint:gosec
+func TestWithUserID(t *testing.T) {
+	t.Parallel()
+
+	expectedPasswd := `root:x:0:0:root:/root:/bin/ash
+guest:x:405:100:guest:/dev/null:/sbin/nologin
+`
+	td := t.TempDir()
+	apply := fstest.Apply(
+		fstest.CreateDir("/etc", 0777),
+		fstest.CreateFile("/etc/passwd", []byte(expectedPasswd), 0777),
+	)
+	if err := apply.Apply(td); err != nil {
+		t.Fatalf("failed to apply: %v", err)
+	}
+	c := containers.Container{ID: t.Name()}
+	testCases := []struct {
+		userID      uint32
+		expectedUID uint32
+		expectedGID uint32
+	}{
+		{
+			userID:      0,
+			expectedUID: 0,
+			expectedGID: 0,
+		},
+		{
+			userID:      405,
+			expectedUID: 405,
+			expectedGID: 100,
+		},
+		{
+			userID:      1000,
+			expectedUID: 1000,
+			expectedGID: 0,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(fmt.Sprintf("user %d", testCase.userID), func(t *testing.T) {
+			t.Parallel()
+			s := Spec{
+				Version: specs.Version,
+				Root: &specs.Root{
+					Path: td,
+				},
+				Linux: &specs.Linux{},
+			}
+			err := WithUserID(testCase.userID)(context.Background(), nil, &c, &s)
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.expectedUID, s.Process.User.UID)
+			assert.Equal(t, testCase.expectedGID, s.Process.User.GID)
+		})
+	}
+}
+
+//nolint:gosec
+func TestWithUsername(t *testing.T) {
+	t.Parallel()
+
+	expectedPasswd := `root:x:0:0:root:/root:/bin/ash
+guest:x:405:100:guest:/dev/null:/sbin/nologin
+`
+	td := t.TempDir()
+	apply := fstest.Apply(
+		fstest.CreateDir("/etc", 0777),
+		fstest.CreateFile("/etc/passwd", []byte(expectedPasswd), 0777),
+	)
+	if err := apply.Apply(td); err != nil {
+		t.Fatalf("failed to apply: %v", err)
+	}
+	c := containers.Container{ID: t.Name()}
+	testCases := []struct {
+		user        string
+		expectedUID uint32
+		expectedGID uint32
+		err         string
+	}{
+		{
+			user:        "root",
+			expectedUID: 0,
+			expectedGID: 0,
+		},
+		{
+			user:        "guest",
+			expectedUID: 405,
+			expectedGID: 100,
+		},
+		{
+			user: "1000",
+			err:  "no users found",
+		},
+		{
+			user: "unknown",
+			err:  "no users found",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.user, func(t *testing.T) {
+			t.Parallel()
+			s := Spec{
+				Version: specs.Version,
+				Root: &specs.Root{
+					Path: td,
+				},
+				Linux: &specs.Linux{},
+			}
+			err := WithUsername(testCase.user)(context.Background(), nil, &c, &s)
+			if err != nil {
+				assert.EqualError(t, err, testCase.err)
+			}
+			assert.Equal(t, testCase.expectedUID, s.Process.User.UID)
+			assert.Equal(t, testCase.expectedGID, s.Process.User.GID)
+		})
+	}
+
+}
+
+//nolint:gosec
+func TestWithAdditionalGIDs(t *testing.T) {
+	t.Parallel()
+	expectedPasswd := `root:x:0:0:root:/root:/bin/ash
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+`
+	expectedGroup := `root:x:0:root
+bin:x:1:root,bin,daemon
+daemon:x:2:root,bin,daemon
+sys:x:3:root,bin,adm
+`
+	td := t.TempDir()
+	apply := fstest.Apply(
+		fstest.CreateDir("/etc", 0777),
+		fstest.CreateFile("/etc/passwd", []byte(expectedPasswd), 0777),
+		fstest.CreateFile("/etc/group", []byte(expectedGroup), 0777),
+	)
+	if err := apply.Apply(td); err != nil {
+		t.Fatalf("failed to apply: %v", err)
+	}
+	c := containers.Container{ID: t.Name()}
+
+	testCases := []struct {
+		user     string
+		expected []uint32
+	}{
+		{
+			user:     "root",
+			expected: []uint32{},
+		},
+		{
+			user:     "1000",
+			expected: []uint32{},
+		},
+		{
+			user:     "bin",
+			expected: []uint32{2, 3},
+		},
+		{
+			user:     "bin:root",
+			expected: []uint32{},
+		},
+		{
+			user:     "daemon",
+			expected: []uint32{1},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.user, func(t *testing.T) {
+			t.Parallel()
+			s := Spec{
+				Version: specs.Version,
+				Root: &specs.Root{
+					Path: td,
+				},
+			}
+			err := WithAdditionalGIDs(testCase.user)(context.Background(), nil, &c, &s)
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.expected, s.Process.User.AdditionalGids)
+		})
+	}
+}
 
 func TestAddCaps(t *testing.T) {
 	t.Parallel()
@@ -39,7 +225,6 @@ func TestAddCaps(t *testing.T) {
 		s.Process.Capabilities.Bounding,
 		s.Process.Capabilities.Effective,
 		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
 	} {
 		if !capsContain(cl, "CAP_CHOWN") {
 			t.Errorf("cap list %d does not contain added cap", i)
@@ -63,7 +248,6 @@ func TestDropCaps(t *testing.T) {
 		s.Process.Capabilities.Bounding,
 		s.Process.Capabilities.Effective,
 		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
 	} {
 		if capsContain(cl, "CAP_CHOWN") {
 			t.Errorf("cap list %d contains dropped cap", i)
@@ -82,7 +266,6 @@ func TestDropCaps(t *testing.T) {
 		s.Process.Capabilities.Bounding,
 		s.Process.Capabilities.Effective,
 		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
 	} {
 		if capsContain(cl, "CAP_FOWNER") {
 			t.Errorf("cap list %d contains dropped cap", i)
@@ -103,7 +286,6 @@ func TestDropCaps(t *testing.T) {
 		s.Process.Capabilities.Bounding,
 		s.Process.Capabilities.Effective,
 		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
 	} {
 		if len(cl) != 0 {
 			t.Errorf("cap list %d is not empty", i)
@@ -250,4 +432,159 @@ func TestGetDevices(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestWithAppendAdditionalGroups(t *testing.T) {
+	t.Parallel()
+	expectedContent := `root:x:0:root
+bin:x:1:root,bin,daemon
+daemon:x:2:root,bin,daemon
+`
+	td := t.TempDir()
+	apply := fstest.Apply(
+		fstest.CreateDir("/etc", 0777),
+		fstest.CreateFile("/etc/group", []byte(expectedContent), 0777),
+	)
+	if err := apply.Apply(td); err != nil {
+		t.Fatalf("failed to apply: %v", err)
+	}
+	c := containers.Container{ID: t.Name()}
+
+	testCases := []struct {
+		name           string
+		additionalGIDs []uint32
+		groups         []string
+		expected       []uint32
+		err            string
+	}{
+		{
+			name:   "no additional gids",
+			groups: []string{},
+		},
+		{
+			name:     "no additional gids, append root gid",
+			groups:   []string{"root"},
+			expected: []uint32{0},
+		},
+		{
+			name:     "no additional gids, append bin and daemon gids",
+			groups:   []string{"bin", "daemon"},
+			expected: []uint32{1, 2},
+		},
+		{
+			name:           "has root additional gids, append bin and daemon gids",
+			additionalGIDs: []uint32{0},
+			groups:         []string{"bin", "daemon"},
+			expected:       []uint32{0, 1, 2},
+		},
+		{
+			name:     "append group id",
+			groups:   []string{"999"},
+			expected: []uint32{999},
+		},
+		{
+			name:   "unknown group",
+			groups: []string{"unknown"},
+			err:    "unable to find group unknown",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			s := Spec{
+				Version: specs.Version,
+				Root: &specs.Root{
+					Path: td,
+				},
+				Process: &specs.Process{
+					User: specs.User{
+						AdditionalGids: testCase.additionalGIDs,
+					},
+				},
+			}
+			err := WithAppendAdditionalGroups(testCase.groups...)(context.Background(), nil, &c, &s)
+			if err != nil {
+				assert.EqualError(t, err, testCase.err)
+			}
+			assert.Equal(t, testCase.expected, s.Process.User.AdditionalGids)
+		})
+	}
+}
+func TestWithLinuxDeviceFollowSymlinks(t *testing.T) {
+
+	// Create symlink to /dev/zero for the symlink test case
+	zero := "/dev/zero"
+	_, err := os.Stat(zero)
+	require.NoError(t, err, "Host does not have /dev/zero")
+
+	dir := t.TempDir()
+	symZero := filepath.Join(dir, "zero")
+
+	err = os.Symlink(zero, symZero)
+	require.NoError(t, err, "unexpected error creating symlink")
+
+	testcases := []struct {
+		name           string
+		path           string
+		followSymlinks bool
+
+		expectError          bool
+		expectedLinuxDevices []specs.LinuxDevice
+	}{
+		{
+			name:        "regularDeviceresolvesPath",
+			path:        zero,
+			expectError: false,
+			expectedLinuxDevices: []specs.LinuxDevice{{
+				Path: zero,
+				Type: "c",
+			}},
+		},
+		{
+			name:        "symlinkedDeviceResolvesPath",
+			path:        symZero,
+			expectError: false,
+			expectedLinuxDevices: []specs.LinuxDevice{{
+				Path: zero,
+				Type: "c",
+			}},
+		},
+		{
+			name:        "symlinkedDeviceResolvesFakePath_error",
+			path:        "/fake/path",
+			expectError: true,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := Spec{
+				Version: specs.Version,
+				Root:    &specs.Root{},
+				Linux:   &specs.Linux{},
+			}
+
+			opts := []SpecOpts{
+				WithLinuxDeviceFollowSymlinks(tc.path, ""),
+			}
+
+			for _, opt := range opts {
+				if err := opt(nil, nil, nil, &spec); err != nil {
+					if tc.expectError {
+						assert.Error(t, err)
+					} else {
+						assert.NoError(t, err)
+					}
+				}
+			}
+			if len(tc.expectedLinuxDevices) != 0 {
+				require.NotNil(t, spec.Linux)
+				require.Len(t, spec.Linux.Devices, 1)
+
+				assert.Equal(t, spec.Linux.Devices[0].Path, tc.expectedLinuxDevices[0].Path)
+				assert.Equal(t, spec.Linux.Devices[0].Type, tc.expectedLinuxDevices[0].Type)
+			}
+		})
+	}
 }

@@ -17,11 +17,12 @@
 package server
 
 import (
+	"context"
 	"errors"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
-	"golang.org/x/net/context"
+	"github.com/containerd/containerd/tracing"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 	runtime_alpha "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
@@ -72,7 +73,7 @@ func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.Run
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("RunPodsandbox for %+v", r.GetConfig().GetMetadata())
+	log.G(ctx).Infof("RunPodSandbox for %+v", r.GetConfig().GetMetadata())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
@@ -88,7 +89,7 @@ func (in *instrumentedAlphaService) RunPodSandbox(ctx context.Context, r *runtim
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("RunPodsandbox for %+v", r.GetConfig().GetMetadata())
+	log.G(ctx).Infof("RunPodSandbox for %+v", r.GetConfig().GetMetadata())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
@@ -878,7 +879,7 @@ func (in *instrumentedService) UpdateContainerResources(ctx context.Context, r *
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("UpdateContainerResources for %q with %+v", r.GetContainerId(), r.GetLinux())
+	log.G(ctx).Infof("UpdateContainerResources for %q with Linux: %+v / Windows: %+v", r.GetContainerId(), r.GetLinux(), r.GetWindows())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("UpdateContainerResources for %q failed", r.GetContainerId())
@@ -894,7 +895,7 @@ func (in *instrumentedAlphaService) UpdateContainerResources(ctx context.Context
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("UpdateContainerResources for %q with %+v", r.GetContainerId(), r.GetLinux())
+	log.G(ctx).Infof("UpdateContainerResources for %q with Linux: %+v / Windows: %+v", r.GetContainerId(), r.GetLinux(), r.GetWindows())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("UpdateContainerResources for %q failed", r.GetContainerId())
@@ -931,6 +932,8 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "PullImage"))
+	defer span.End()
 	log.G(ctx).Infof("PullImage %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
@@ -939,6 +942,7 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
 		}
+		span.SetStatus(err)
 	}()
 	res, err = in.c.PullImage(ctrdutil.WithNamespace(ctx), r)
 	return res, errdefs.ToGRPC(err)
@@ -948,6 +952,8 @@ func (in *instrumentedAlphaService) PullImage(ctx context.Context, r *runtime_al
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "PullImage"))
+	defer span.End()
 	log.G(ctx).Infof("PullImage %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
@@ -956,6 +962,7 @@ func (in *instrumentedAlphaService) PullImage(ctx context.Context, r *runtime_al
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
 		}
+		span.SetStatus(err)
 	}()
 	// converts request and response for earlier CRI version to call and get response from the current version
 	var v1r runtime.PullImageRequest
@@ -986,6 +993,8 @@ func (in *instrumentedService) ListImages(ctx context.Context, r *runtime.ListIm
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ListImages"))
+	defer span.End()
 	log.G(ctx).Tracef("ListImages with filter %+v", r.GetFilter())
 	defer func() {
 		if err != nil {
@@ -994,6 +1003,7 @@ func (in *instrumentedService) ListImages(ctx context.Context, r *runtime.ListIm
 			log.G(ctx).Tracef("ListImages with filter %+v returns image list %+v",
 				r.GetFilter(), res.GetImages())
 		}
+		span.SetStatus(err)
 	}()
 	res, err = in.c.ListImages(ctrdutil.WithNamespace(ctx), r)
 	return res, errdefs.ToGRPC(err)
@@ -1003,6 +1013,8 @@ func (in *instrumentedAlphaService) ListImages(ctx context.Context, r *runtime_a
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ListImages"))
+	defer span.End()
 	log.G(ctx).Tracef("ListImages with filter %+v", r.GetFilter())
 	defer func() {
 		if err != nil {
@@ -1011,6 +1023,7 @@ func (in *instrumentedAlphaService) ListImages(ctx context.Context, r *runtime_a
 			log.G(ctx).Tracef("ListImages with filter %+v returns image list %+v",
 				r.GetFilter(), res.GetImages())
 		}
+		span.SetStatus(err)
 	}()
 	// converts request and response for earlier CRI version to call and get response from the current version
 	var v1r runtime.ListImagesRequest
@@ -1041,6 +1054,8 @@ func (in *instrumentedService) ImageStatus(ctx context.Context, r *runtime.Image
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ImageStatus"))
+	defer span.End()
 	log.G(ctx).Tracef("ImageStatus for %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
@@ -1049,6 +1064,7 @@ func (in *instrumentedService) ImageStatus(ctx context.Context, r *runtime.Image
 			log.G(ctx).Tracef("ImageStatus for %q returns image status %+v",
 				r.GetImage().GetImage(), res.GetImage())
 		}
+		span.SetStatus(err)
 	}()
 	res, err = in.c.ImageStatus(ctrdutil.WithNamespace(ctx), r)
 	return res, errdefs.ToGRPC(err)
@@ -1058,6 +1074,8 @@ func (in *instrumentedAlphaService) ImageStatus(ctx context.Context, r *runtime_
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ImageStatus"))
+	defer span.End()
 	log.G(ctx).Tracef("ImageStatus for %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
@@ -1066,6 +1084,7 @@ func (in *instrumentedAlphaService) ImageStatus(ctx context.Context, r *runtime_
 			log.G(ctx).Tracef("ImageStatus for %q returns image status %+v",
 				r.GetImage().GetImage(), res.GetImage())
 		}
+		span.SetStatus(err)
 	}()
 	// converts request and response for earlier CRI version to call and get response from the current version
 	var v1r runtime.ImageStatusRequest
@@ -1096,6 +1115,8 @@ func (in *instrumentedService) RemoveImage(ctx context.Context, r *runtime.Remov
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "RemoveImage"))
+	defer span.End()
 	log.G(ctx).Infof("RemoveImage %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
@@ -1103,6 +1124,7 @@ func (in *instrumentedService) RemoveImage(ctx context.Context, r *runtime.Remov
 		} else {
 			log.G(ctx).Infof("RemoveImage %q returns successfully", r.GetImage().GetImage())
 		}
+		span.SetStatus(err)
 	}()
 	res, err := in.c.RemoveImage(ctrdutil.WithNamespace(ctx), r)
 	return res, errdefs.ToGRPC(err)
@@ -1112,6 +1134,8 @@ func (in *instrumentedAlphaService) RemoveImage(ctx context.Context, r *runtime_
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "RemoveImage"))
+	defer span.End()
 	log.G(ctx).Infof("RemoveImage %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
@@ -1119,6 +1143,7 @@ func (in *instrumentedAlphaService) RemoveImage(ctx context.Context, r *runtime_
 		} else {
 			log.G(ctx).Infof("RemoveImage %q returns successfully", r.GetImage().GetImage())
 		}
+		span.SetStatus(err)
 	}()
 	// converts request and response for earlier CRI version to call and get response from the current version
 	var v1r runtime.RemoveImageRequest
@@ -1149,6 +1174,8 @@ func (in *instrumentedService) ImageFsInfo(ctx context.Context, r *runtime.Image
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ImageFsInfo"))
+	defer span.End()
 	log.G(ctx).Debugf("ImageFsInfo")
 	defer func() {
 		if err != nil {
@@ -1156,6 +1183,7 @@ func (in *instrumentedService) ImageFsInfo(ctx context.Context, r *runtime.Image
 		} else {
 			log.G(ctx).Debugf("ImageFsInfo returns filesystem info %+v", res.ImageFilesystems)
 		}
+		span.SetStatus(err)
 	}()
 	res, err = in.c.ImageFsInfo(ctrdutil.WithNamespace(ctx), r)
 	return res, errdefs.ToGRPC(err)
@@ -1165,6 +1193,8 @@ func (in *instrumentedAlphaService) ImageFsInfo(ctx context.Context, r *runtime_
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ImageFsInfo"))
+	defer span.End()
 	log.G(ctx).Debugf("ImageFsInfo")
 	defer func() {
 		if err != nil {
@@ -1172,6 +1202,7 @@ func (in *instrumentedAlphaService) ImageFsInfo(ctx context.Context, r *runtime_
 		} else {
 			log.G(ctx).Debugf("ImageFsInfo returns filesystem info %+v", res.ImageFilesystems)
 		}
+		span.SetStatus(err)
 	}()
 	// converts request and response for earlier CRI version to call and get response from the current version
 	var v1r runtime.ImageFsInfoRequest
@@ -1192,6 +1223,59 @@ func (in *instrumentedAlphaService) ImageFsInfo(ctx context.Context, r *runtime_
 			} else {
 				// extra log entry if convert response parse error and request error
 				log.G(ctx).WithError(perr).Error("ImageFsInfo failed")
+			}
+		}
+	}
+	return res, errdefs.ToGRPC(err)
+}
+
+func (in *instrumentedService) PodSandboxStats(ctx context.Context, r *runtime.PodSandboxStatsRequest) (res *runtime.PodSandboxStatsResponse, err error) {
+	if err := in.checkInitialized(); err != nil {
+		return nil, err
+	}
+	log.G(ctx).Debugf("PodSandboxStats for %q", r.GetPodSandboxId())
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Errorf("PodSandboxStats for %q failed", r.GetPodSandboxId())
+		} else {
+			log.G(ctx).Debugf("PodSandboxStats for %q returns stats %+v", r.GetPodSandboxId(), res.GetStats())
+		}
+	}()
+	res, err = in.c.PodSandboxStats(ctrdutil.WithNamespace(ctx), r)
+	return res, errdefs.ToGRPC(err)
+}
+
+func (in *instrumentedAlphaService) PodSandboxStats(ctx context.Context, r *runtime_alpha.PodSandboxStatsRequest) (res *runtime_alpha.PodSandboxStatsResponse, err error) {
+	if err := in.checkInitialized(); err != nil {
+		return nil, err
+	}
+	log.G(ctx).Debugf("PodSandboxStats for %q", r.GetPodSandboxId())
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Errorf("PodSandboxStats for %q failed", r.GetPodSandboxId())
+		} else {
+			log.G(ctx).Debugf("PodSandboxStats for %q returns stats %+v", r.GetPodSandboxId(), res.GetStats())
+		}
+	}()
+	// converts request and response for earlier CRI version to call and get response from the current version
+	var v1r runtime.PodSandboxStatsRequest
+	if err := alphaReqToV1Req(r, &v1r); err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	var v1res *runtime.PodSandboxStatsResponse
+	v1res, err = in.c.PodSandboxStats(ctrdutil.WithNamespace(ctx), &v1r)
+	if v1res != nil {
+		resp := &runtime_alpha.PodSandboxStatsResponse{}
+		perr := v1RespToAlphaResp(v1res, resp)
+		if perr == nil {
+			res = resp
+		} else {
+			// actual error has precidence on error returned vs parse error issues
+			if err == nil {
+				err = perr
+			} else {
+				// extra log entry if convert response parse error and request error
+				log.G(ctx).WithError(err).Errorf("PodSandboxStats for %q failed", r.GetPodSandboxId())
 			}
 		}
 	}
@@ -1245,6 +1329,59 @@ func (in *instrumentedAlphaService) ContainerStats(ctx context.Context, r *runti
 			} else {
 				// extra log entry if convert response parse error and request error
 				log.G(ctx).WithError(perr).Errorf("ContainerStats for %q failed", r.GetContainerId())
+			}
+		}
+	}
+	return res, errdefs.ToGRPC(err)
+}
+
+func (in *instrumentedService) ListPodSandboxStats(ctx context.Context, r *runtime.ListPodSandboxStatsRequest) (res *runtime.ListPodSandboxStatsResponse, err error) {
+	if err := in.checkInitialized(); err != nil {
+		return nil, err
+	}
+	log.G(ctx).Tracef("ListPodSandboxStats with filter %+v", r.GetFilter())
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Error("ListPodSandboxStats failed")
+		} else {
+			log.G(ctx).Tracef("ListPodSandboxStats returns stats %+v", res.GetStats())
+		}
+	}()
+	res, err = in.c.ListPodSandboxStats(ctrdutil.WithNamespace(ctx), r)
+	return res, errdefs.ToGRPC(err)
+}
+
+func (in *instrumentedAlphaService) ListPodSandboxStats(ctx context.Context, r *runtime_alpha.ListPodSandboxStatsRequest) (res *runtime_alpha.ListPodSandboxStatsResponse, err error) {
+	if err := in.checkInitialized(); err != nil {
+		return nil, err
+	}
+	log.G(ctx).Tracef("ListPodSandboxStats with filter %+v", r.GetFilter())
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Error("ListPodSandboxStats failed")
+		} else {
+			log.G(ctx).Tracef("ListPodSandboxStats returns stats %+v", res.GetStats())
+		}
+	}()
+	// converts request and response for earlier CRI version to call and get response from the current version
+	var v1r runtime.ListPodSandboxStatsRequest
+	if err := alphaReqToV1Req(r, &v1r); err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	var v1res *runtime.ListPodSandboxStatsResponse
+	v1res, err = in.c.ListPodSandboxStats(ctrdutil.WithNamespace(ctx), &v1r)
+	if v1res != nil {
+		resp := &runtime_alpha.ListPodSandboxStatsResponse{}
+		perr := v1RespToAlphaResp(v1res, resp)
+		if perr == nil {
+			res = resp
+		} else {
+			// actual error has precidence on error returned vs parse error issues
+			if err == nil {
+				err = perr
+			} else {
+				// extra log entry if convert response parse error and request error
+				log.G(ctx).WithError(perr).Error("ListPodSandboxStats failed")
 			}
 		}
 	}
@@ -1471,33 +1608,63 @@ func (in *instrumentedAlphaService) ReopenContainerLog(ctx context.Context, r *r
 		}
 	}()
 	// converts request and response for earlier CRI version to call and get response from the current version
-	p, err := r.Marshal()
-	if err == nil {
-		var v1r runtime.ReopenContainerLogRequest
-		if err = v1r.Unmarshal(p); err == nil {
-			var v1res *runtime.ReopenContainerLogResponse
-			v1res, err = in.c.ReopenContainerLog(ctrdutil.WithNamespace(ctx), &v1r)
-			if v1res != nil {
-				p, perr := v1res.Marshal()
-				if perr == nil {
-					resp := &runtime_alpha.ReopenContainerLogResponse{}
-					if perr = resp.Unmarshal(p); perr == nil {
-						res = resp
-					}
-				}
-				// actual error has precidence on error returned vs parse error issues
-				if perr != nil {
-					if err == nil {
-						err = perr
-					} else {
-						// extra log entry if convert response parse error and request error
-						log.G(ctx).WithError(perr).Errorf("ReopenContainerLog for %q failed", r.GetContainerId())
-					}
-				}
+	var v1r runtime.ReopenContainerLogRequest
+	if err := alphaReqToV1Req(r, &v1r); err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	var v1res *runtime.ReopenContainerLogResponse
+	v1res, err = in.c.ReopenContainerLog(ctrdutil.WithNamespace(ctx), &v1r)
+	if v1res != nil {
+		resp := &runtime_alpha.ReopenContainerLogResponse{}
+		perr := v1RespToAlphaResp(v1res, resp)
+		if perr == nil {
+			res = resp
+		} else {
+			// actual error has precidence on error returned vs parse error issues
+			if err == nil {
+				err = perr
+			} else {
+				// extra log entry if convert response parse error and request error
+				log.G(ctx).WithError(perr).Errorf("ReopenContainerLog for %q failed", r.GetContainerId())
 			}
 		}
 	}
 	return res, errdefs.ToGRPC(err)
+}
+
+func (in *instrumentedService) CheckpointContainer(ctx context.Context, r *runtime.CheckpointContainerRequest) (res *runtime.CheckpointContainerResponse, err error) {
+	if err := in.checkInitialized(); err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Errorf("CheckpointContainer failed, error")
+		} else {
+			log.G(ctx).Debug("CheckpointContainer returns successfully")
+		}
+	}()
+
+	res, err = in.c.CheckpointContainer(ctx, r)
+	return res, errdefs.ToGRPC(err)
+}
+
+func (in *instrumentedService) GetContainerEvents(r *runtime.GetEventsRequest, s runtime.RuntimeService_GetContainerEventsServer) (err error) {
+	if err := in.checkInitialized(); err != nil {
+		return err
+	}
+
+	ctx := s.Context()
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Errorf("GetContainerEvents failed, error")
+		} else {
+			log.G(ctx).Debug("GetContainerEvents returns successfully")
+		}
+	}()
+
+	err = in.c.GetContainerEvents(r, s)
+	return errdefs.ToGRPC(err)
 }
 
 func alphaReqToV1Req(

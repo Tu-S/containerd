@@ -21,6 +21,7 @@ package run
 
 import (
 	gocontext "context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,8 +39,8 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/intel/goresctrl/pkg/blockio"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -69,6 +70,10 @@ var platformRunFlags = []cli.Flag{
 		Name:  "remap-labels",
 		Usage: "provide the user namespace ID remapping to the snapshotter via label options; requires snapshotter support",
 	},
+	cli.BoolFlag{
+		Name:  "privileged-without-host-devices",
+		Usage: "don't pass all host devices to privileged container",
+	},
 	cli.Float64Flag{
 		Name:  "cpus",
 		Usage: "set the CFS cpu quota",
@@ -78,10 +83,6 @@ var platformRunFlags = []cli.Flag{
 		Name:  "cpu-shares",
 		Usage: "set the cpu shares",
 		Value: 1024,
-	},
-	cli.BoolFlag{
-		Name:  "cni",
-		Usage: "enable cni networking for the container",
 	},
 }
 
@@ -104,12 +105,12 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 	)
 
 	if config {
-		cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("labels"))))
+		cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("label"))))
 		opts = append(opts, oci.WithSpecFromFile(context.String("config")))
 	} else {
 		var (
 			ref = context.Args().First()
-			//for container's id is Args[1]
+			// for container's id is Args[1]
 			args = context.Args()[2:]
 		)
 		opts = append(opts, oci.WithDefaultSpec(), oci.WithDefaultUnixDevices)
@@ -125,7 +126,7 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 				return nil, err
 			}
 			opts = append(opts, oci.WithRootFSPath(rootfs))
-			cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("labels"))))
+			cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("label"))))
 		} else {
 			snapshotter := context.String("snapshotter")
 			var image containerd.Image
@@ -199,16 +200,30 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 		if cwd := context.String("cwd"); cwd != "" {
 			opts = append(opts, oci.WithProcessCwd(cwd))
 		}
+		if user := context.String("user"); user != "" {
+			opts = append(opts, oci.WithUser(user), oci.WithAdditionalGIDs(user))
+		}
 		if context.Bool("tty") {
 			opts = append(opts, oci.WithTTY)
 		}
-		if context.Bool("privileged") {
-			opts = append(opts, oci.WithPrivileged, oci.WithAllDevicesAllowed, oci.WithHostDevices)
+
+		privileged := context.Bool("privileged")
+		privilegedWithoutHostDevices := context.Bool("privileged-without-host-devices")
+		if privilegedWithoutHostDevices && !privileged {
+			return nil, fmt.Errorf("can't use 'privileged-without-host-devices' without 'privileged' specified")
 		}
+		if privileged {
+			if privilegedWithoutHostDevices {
+				opts = append(opts, oci.WithPrivileged)
+			} else {
+				opts = append(opts, oci.WithPrivileged, oci.WithAllDevicesAllowed, oci.WithHostDevices)
+			}
+		}
+
 		if context.Bool("net-host") {
 			hostname, err := os.Hostname()
 			if err != nil {
-				return nil, errors.Wrap(err, "get hostname")
+				return nil, fmt.Errorf("get hostname: %w", err)
 			}
 			opts = append(opts,
 				oci.WithHostNamespace(specs.NetworkNamespace),
@@ -216,6 +231,35 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 				oci.WithHostResolvconf,
 				oci.WithEnv([]string{fmt.Sprintf("HOSTNAME=%s", hostname)}),
 			)
+		}
+		if annoStrings := context.StringSlice("annotation"); len(annoStrings) > 0 {
+			annos, err := commands.AnnotationArgs(annoStrings)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, oci.WithAnnotations(annos))
+		}
+
+		if context.Bool("cni") {
+			cniMeta := &commands.NetworkMetaData{EnableCni: true}
+			cOpts = append(cOpts, containerd.WithContainerExtension(commands.CtrCniMetadataExtension, cniMeta))
+		}
+		if caps := context.StringSlice("cap-add"); len(caps) > 0 {
+			for _, cap := range caps {
+				if !strings.HasPrefix(cap, "CAP_") {
+					return nil, fmt.Errorf("capabilities must be specified with 'CAP_' prefix")
+				}
+			}
+			opts = append(opts, oci.WithAddedCapabilities(caps))
+		}
+
+		if caps := context.StringSlice("cap-drop"); len(caps) > 0 {
+			for _, cap := range caps {
+				if !strings.HasPrefix(cap, "CAP_") {
+					return nil, fmt.Errorf("capabilities must be specified with 'CAP_' prefix")
+				}
+			}
+			opts = append(opts, oci.WithDroppedCapabilities(caps))
 		}
 
 		seccompProfile := context.String("seccomp-profile")
@@ -266,16 +310,16 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 
 		joinNs := context.StringSlice("with-ns")
 		for _, ns := range joinNs {
-			parts := strings.Split(ns, ":")
-			if len(parts) != 2 {
+			nsType, nsPath, ok := strings.Cut(ns, ":")
+			if !ok {
 				return nil, errors.New("joining a Linux namespace using --with-ns requires the format 'nstype:path'")
 			}
-			if !validNamespace(parts[0]) {
-				return nil, errors.New("the Linux namespace type specified in --with-ns is not valid: " + parts[0])
+			if !validNamespace(nsType) {
+				return nil, errors.New("the Linux namespace type specified in --with-ns is not valid: " + nsType)
 			}
 			opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-				Type: specs.LinuxNamespaceType(parts[0]),
-				Path: parts[1],
+				Type: specs.LinuxNamespaceType(nsType),
+				Path: nsPath,
 			}))
 		}
 		if context.IsSet("gpus") {
@@ -309,6 +353,26 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 
 				return nil
 			})
+		}
+
+		if c := context.String("blockio-config-file"); c != "" {
+			if err := blockio.SetConfigFromFile(c, false); err != nil {
+				return nil, fmt.Errorf("blockio-config-file error: %w", err)
+			}
+		}
+
+		if c := context.String("blockio-class"); c != "" {
+			if linuxBlockIO, err := blockio.OciLinuxBlockIO(c); err == nil {
+				opts = append(opts, oci.WithBlockIO(linuxBlockIO))
+			} else {
+				return nil, fmt.Errorf("blockio-class error: %w", err)
+			}
+		}
+		if c := context.String("rdt-class"); c != "" {
+			opts = append(opts, oci.WithRdt(c, "", ""))
+		}
+		if hostname := context.String("hostname"); hostname != "" {
+			opts = append(opts, oci.WithHostname(hostname))
 		}
 	}
 
@@ -393,21 +457,22 @@ func getNewTaskOpts(context *cli.Context) []containerd.NewTaskOpts {
 }
 
 func parseIDMapping(mapping string) (specs.LinuxIDMapping, error) {
-	parts := strings.Split(mapping, ":")
+	// We expect 3 parts, but limit to 4 to allow detection of invalid values.
+	parts := strings.SplitN(mapping, ":", 4)
 	if len(parts) != 3 {
 		return specs.LinuxIDMapping{}, errors.New("user namespace mappings require the format `container-id:host-id:size`")
 	}
 	cID, err := strconv.ParseUint(parts[0], 0, 32)
 	if err != nil {
-		return specs.LinuxIDMapping{}, errors.Wrapf(err, "invalid container id for user namespace remapping")
+		return specs.LinuxIDMapping{}, fmt.Errorf("invalid container id for user namespace remapping: %w", err)
 	}
 	hID, err := strconv.ParseUint(parts[1], 0, 32)
 	if err != nil {
-		return specs.LinuxIDMapping{}, errors.Wrapf(err, "invalid host id for user namespace remapping")
+		return specs.LinuxIDMapping{}, fmt.Errorf("invalid host id for user namespace remapping: %w", err)
 	}
 	size, err := strconv.ParseUint(parts[2], 0, 32)
 	if err != nil {
-		return specs.LinuxIDMapping{}, errors.Wrapf(err, "invalid size for user namespace remapping")
+		return specs.LinuxIDMapping{}, fmt.Errorf("invalid size for user namespace remapping: %w", err)
 	}
 	return specs.LinuxIDMapping{
 		ContainerID: uint32(cID),
@@ -430,4 +495,8 @@ func validNamespace(ns string) bool {
 	default:
 		return false
 	}
+}
+
+func getNetNSPath(_ gocontext.Context, task containerd.Task) (string, error) {
+	return fmt.Sprintf("/proc/%d/ns/net", task.Pid()), nil
 }

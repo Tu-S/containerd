@@ -19,28 +19,39 @@ package v2
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	gruntime "runtime"
 	"strings"
 
+	"github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/protobuf"
+	"github.com/containerd/containerd/protobuf/proto"
+	"github.com/containerd/containerd/protobuf/types"
 	"github.com/containerd/containerd/runtime"
 	client "github.com/containerd/containerd/runtime/v2/shim"
-	"github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/ttrpc"
-	"github.com/gogo/protobuf/types"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
-func shimBinary(bundle *Bundle, runtime, containerdAddress string, containerdTTRPCAddress string) *binary {
+type shimBinaryConfig struct {
+	runtime      string
+	address      string
+	ttrpcAddress string
+	schedCore    bool
+}
+
+func shimBinary(bundle *Bundle, config shimBinaryConfig) *binary {
 	return &binary{
 		bundle:                 bundle,
-		runtime:                runtime,
-		containerdAddress:      containerdAddress,
-		containerdTTRPCAddress: containerdTTRPCAddress,
+		runtime:                config.runtime,
+		containerdAddress:      config.address,
+		containerdTTRPCAddress: config.ttrpcAddress,
+		schedCore:              config.schedCore,
 	}
 }
 
@@ -48,6 +59,7 @@ type binary struct {
 	runtime                string
 	containerdAddress      string
 	containerdTTRPCAddress string
+	schedCore              bool
 	bundle                 *Bundle
 }
 
@@ -61,13 +73,15 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 
 	cmd, err := client.Command(
 		ctx,
-		b.runtime,
-		b.containerdAddress,
-		b.containerdTTRPCAddress,
-		b.bundle.Path,
-		opts,
-		args...,
-	)
+		&client.CommandConfig{
+			Runtime:      b.runtime,
+			Address:      b.containerdAddress,
+			TTRPCAddress: b.containerdTTRPCAddress,
+			Path:         b.bundle.Path,
+			Opts:         opts,
+			Args:         args,
+			SchedCore:    b.schedCore,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +95,7 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 	}()
 	f, err := openShimLog(shimCtx, b.bundle, client.AnonDialer)
 	if err != nil {
-		return nil, errors.Wrap(err, "open shim log pipe")
+		return nil, fmt.Errorf("open shim log pipe: %w", err)
 	}
 	defer func() {
 		if err != nil {
@@ -104,7 +118,7 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 	}()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, errors.Wrapf(err, "%s", out)
+		return nil, fmt.Errorf("%s: %w", out, err)
 	}
 	address := strings.TrimSpace(string(out))
 	conn, err := client.Connect(address, client.AnonDialer)
@@ -116,11 +130,14 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 		cancelShimLog()
 		f.Close()
 	}
+	// Save runtime binary path for restore.
+	if err := os.WriteFile(filepath.Join(b.bundle.Path, "shim-binary-path"), []byte(b.runtime), 0600); err != nil {
+		return nil, err
+	}
 	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onCloseWithShimLog))
 	return &shim{
 		bundle: b.bundle,
 		client: client,
-		task:   task.NewTaskClient(client),
 	}, nil
 }
 
@@ -138,14 +155,19 @@ func (b *binary) Delete(ctx context.Context) (*runtime.Exit, error) {
 	}
 
 	cmd, err := client.Command(ctx,
-		b.runtime,
-		b.containerdAddress,
-		b.containerdTTRPCAddress,
-		bundlePath,
-		nil,
-		"-id", b.bundle.ID,
-		"-bundle", b.bundle.Path,
-		"delete")
+		&client.CommandConfig{
+			Runtime:      b.runtime,
+			Address:      b.containerdAddress,
+			TTRPCAddress: b.containerdTTRPCAddress,
+			Path:         bundlePath,
+			Opts:         nil,
+			Args: []string{
+				"-id", b.bundle.ID,
+				"-bundle", b.bundle.Path,
+				"delete",
+			},
+		})
+
 	if err != nil {
 		return nil, err
 	}
@@ -157,14 +179,14 @@ func (b *binary) Delete(ctx context.Context) (*runtime.Exit, error) {
 	cmd.Stderr = errb
 	if err := cmd.Run(); err != nil {
 		log.G(ctx).WithField("cmd", cmd).WithError(err).Error("failed to delete")
-		return nil, errors.Wrapf(err, "%s", errb.String())
+		return nil, fmt.Errorf("%s: %w", errb.String(), err)
 	}
 	s := errb.String()
 	if s != "" {
 		log.G(ctx).Warnf("cleanup warnings %s", s)
 	}
 	var response task.DeleteResponse
-	if err := response.Unmarshal(out.Bytes()); err != nil {
+	if err := proto.Unmarshal(out.Bytes(), &response); err != nil {
 		return nil, err
 	}
 	if err := b.bundle.Delete(); err != nil {
@@ -172,7 +194,7 @@ func (b *binary) Delete(ctx context.Context) (*runtime.Exit, error) {
 	}
 	return &runtime.Exit{
 		Status:    response.ExitStatus,
-		Timestamp: response.ExitedAt,
+		Timestamp: protobuf.FromTimestamp(response.ExitedAt),
 		Pid:       response.Pid,
 	}, nil
 }

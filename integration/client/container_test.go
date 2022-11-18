@@ -19,6 +19,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -29,19 +30,23 @@ import (
 	"time"
 
 	. "github.com/containerd/containerd"
+	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/log/logtest"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/plugin"
+	gogotypes "github.com/containerd/containerd/protobuf/types"
 	_ "github.com/containerd/containerd/runtime"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
-	gogotypes "github.com/gogo/protobuf/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/require"
 	exec "golang.org/x/sys/execabs"
 )
 
@@ -49,7 +54,7 @@ func empty() cio.Creator {
 	// TODO (@mlaventure) windows searches for pipes
 	// when none are provided
 	if runtime.GOOS == "windows" {
-		return cio.NewCreator(cio.WithStdio)
+		return cio.NewCreator(cio.WithStdio, cio.WithTerminal)
 	}
 	return cio.NullIO
 }
@@ -1302,9 +1307,6 @@ func TestDeleteContainerExecCreated(t *testing.T) {
 }
 
 func TestContainerMetrics(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("metrics are currently not supported on windows")
-	}
 	t.Parallel()
 
 	client, err := newClient(t, address)
@@ -1359,9 +1361,6 @@ func TestContainerMetrics(t *testing.T) {
 }
 
 func TestDeletedContainerMetrics(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("metrics are currently not supported on windows")
-	}
 	t.Parallel()
 
 	client, err := newClient(t, address)
@@ -1442,11 +1441,11 @@ func TestContainerExtensions(t *testing.T) {
 		if len(cExts) != 1 {
 			t.Errorf("expected 1 container extension")
 		}
-		if cExts["hello"].TypeUrl != ext.TypeUrl {
-			t.Errorf("got unexpected type url for extension: %s", cExts["hello"].TypeUrl)
+		if actual := cExts["hello"].GetTypeUrl(); actual != ext.TypeUrl {
+			t.Errorf("got unexpected type url for extension: %s", actual)
 		}
-		if !bytes.Equal(cExts["hello"].Value, ext.Value) {
-			t.Errorf("expected extension value %q, got: %q", ext.Value, cExts["hello"].Value)
+		if actual := cExts["hello"].GetValue(); !bytes.Equal(actual, ext.Value) {
+			t.Errorf("expected extension value %q, got: %q", ext.Value, actual)
 		}
 	}
 
@@ -1570,6 +1569,12 @@ func TestContainerLabels(t *testing.T) {
 }
 
 func TestContainerHook(t *testing.T) {
+	// OCI hooks aren't implemented on Windows. This test will actually run fine on Windows if there's a 'ps' binary in the users PATH, but
+	// there's not any actual hook functionality being tested as any of the OCI fields are plain ignored for Windows containers.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
 	t.Parallel()
 
 	client, err := newClient(t, address)
@@ -1835,5 +1840,742 @@ func TestShortRunningTaskPid(t *testing.T) {
 func withProcessTTY() cio.Opt {
 	return func(opt *cio.Streams) {
 		cio.WithTerminal(opt)
+	}
+}
+
+// TestRegressionIssue4769 verifies the number of task exit events.
+//
+// Issue: https://github.com/containerd/containerd/issues/4769.
+func TestRegressionIssue4769(t *testing.T) {
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// use unique namespace to get unique task events
+	id := t.Name()
+	ns := fmt.Sprintf("%s-%s", testNamespace, id)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx = namespaces.WithNamespace(ctx, ns)
+	ctx = logtest.WithT(ctx, t)
+
+	image, err := client.Pull(ctx, testImage, WithPullUnpack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.ImageService().Delete(ctx, testImage, images.SynchronousDelete())
+
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), withTrue()),
+		WithRuntime(client.Runtime(), nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	task, err := container.NewTask(ctx, empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eventStream, errC := client.EventService().Subscribe(ctx, "namespace=="+ns+",topic~=|^/tasks/exit|")
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var timeout = 3 * time.Second
+
+	select {
+	case et := <-statusC:
+		if got := et.ExitCode(); got != 0 {
+			t.Fatal(fmt.Errorf("expect zero exit status, but got %v", got))
+		}
+	case <-time.After(timeout):
+		t.Fatal(fmt.Errorf("failed to get exit event in time"))
+	}
+
+	// start to check events
+	select {
+	case et := <-eventStream:
+		if et.Event == nil {
+			t.Fatal(fmt.Errorf("unexpected empty event: %+v", et))
+		}
+
+		v, err := typeurl.UnmarshalAny(et.Event)
+		if err != nil {
+			t.Fatal(fmt.Errorf("failed to unmarshal event: %w", err))
+		}
+
+		if e, ok := v.(*apievents.TaskExit); !ok {
+			t.Fatal(fmt.Errorf("unexpected event type: %+v", v))
+		} else if e.ExitStatus != 0 {
+			t.Fatal(fmt.Errorf("expect zero exit status, but got %v", e.ExitStatus))
+		}
+	case err := <-errC:
+		t.Fatal(fmt.Errorf("unexpected error from event service: %w", err))
+
+	case <-time.After(timeout):
+		t.Fatal(fmt.Errorf("failed to get exit event in time"))
+	}
+
+	if _, err := task.Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// check duplicate event should not show up
+	select {
+	case event := <-eventStream:
+		t.Fatal(fmt.Errorf("unexpected exit event: %+v", event))
+	case err := <-errC:
+		t.Fatal(fmt.Errorf("unexpected error from event service: %w", err))
+	case <-time.After(timeout):
+	}
+}
+
+// TestRegressionIssue6429 should not send exit event out if command is not found.
+//
+// Issue: https://github.com/containerd/containerd/issues/6429.
+func TestRegressionIssue6429(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("Test relies on runc")
+	}
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// use unique namespace to get unique task events
+	id := t.Name()
+	ns := fmt.Sprintf("%s-%s", testNamespace, id)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx = namespaces.WithNamespace(ctx, ns)
+	ctx = logtest.WithT(ctx, t)
+
+	image, err := client.Pull(ctx, testImage, WithPullUnpack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.ImageService().Delete(ctx, testImage, images.SynchronousDelete())
+
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), withProcessArgs("notfound404")),
+		WithRuntime(client.Runtime(), nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	eventStream, errC := client.EventService().Subscribe(ctx, "namespace=="+ns+",topic~=|^/tasks/exit|")
+
+	if _, err := container.NewTask(ctx, empty()); err == nil {
+		t.Fatalf("expected error but got nil")
+	}
+
+	var timeout = 10 * time.Second
+
+	// start to check events
+	select {
+	case et := <-eventStream:
+		t.Fatal(fmt.Errorf("unexpected task exit event: %+v", et))
+	case err := <-errC:
+		t.Fatal(fmt.Errorf("unexpected error from event service: %w", err))
+
+	case <-time.After(timeout):
+	}
+}
+
+func TestDaemonRestart(t *testing.T) {
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), longCommand))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	task, err := container.NewTask(ctx, empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		if _, err := task.Delete(ctx, WithProcessKill); err != nil {
+			t.Logf("failed to delete task: %v", err)
+		}
+	}()
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var exitStatus ExitStatus
+	if err := ctrd.Restart(func() {
+		exitStatus = <-statusC
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if exitStatus.Error() == nil {
+		t.Errorf(`first task.Wait() should have failed with "transport is closing"`)
+	}
+
+	// NOTE(gabriel-samfira): Windows needs a bit more time to restart.
+	// Increase timeout from 2 seconds to 10 seconds to avoid deadline
+	// exceeded errors.
+	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
+	serving, err := client.IsServing(waitCtx)
+	waitCancel()
+	if !serving {
+		t.Fatalf("containerd did not start within 2s: %v", err)
+	}
+
+	statusC, err = task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+
+	<-statusC
+}
+
+type directIO struct {
+	cio.DirectIO
+}
+
+// ioCreate returns IO available for use with task creation
+func (f *directIO) IOCreate(id string) (cio.IO, error) {
+	return f, nil
+}
+
+// ioAttach returns IO available for use with task attachment
+func (f *directIO) IOAttach(set *cio.FIFOSet) (cio.IO, error) {
+	return f, nil
+}
+
+func (f *directIO) Cancel() {
+	// nothing to cancel as all operations are handled externally
+}
+
+// Close closes all open fds
+func (f *directIO) Close() error {
+	err := f.Stdin.Close()
+	if f.Stdout != nil {
+		if err2 := f.Stdout.Close(); err == nil {
+			err = err2
+		}
+	}
+	if f.Stderr != nil {
+		if err2 := f.Stderr.Close(); err == nil {
+			err = err2
+		}
+	}
+	return err
+}
+
+// Delete removes the underlying directory containing fifos
+func (f *directIO) Delete() error {
+	return f.DirectIO.Close()
+}
+
+func initContainerAndCheckChildrenDieOnKill(t *testing.T, opts ...oci.SpecOpts) {
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts = append(opts, oci.WithImageConfig(image))
+	opts = append(opts, longCommand)
+
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(opts...),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	stdout := bytes.NewBuffer(nil)
+	task, err := container.NewTask(ctx, cio.NewCreator(withByteBuffers(stdout)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
+		t.Error(err)
+	}
+
+	// Give the shim time to reap the init process and kill the orphans
+	select {
+	case <-statusC:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	command := []string{"ps", "ax"}
+	if runtime.GOOS == "windows" {
+		command = []string{"tasklist"}
+	}
+	b, err := exec.Command(command[0], command[1:]...).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The container is using longCommand, which contains sleep 1 on Linux, and ping -t localhost on Windows.
+	if strings.Contains(string(b), "sleep 1") || strings.Contains(string(b), "ping -t localhost") {
+		t.Fatalf("killing init didn't kill all its children:\n%v", string(b))
+	}
+
+	if _, err := task.Delete(ctx, WithProcessKill); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestContainerKillInitKillsChildWhenNotHostPid(t *testing.T) {
+	initContainerAndCheckChildrenDieOnKill(t)
+}
+
+func TestTaskResize(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// PowerShell can, but nanoserver images don't have that.
+		t.Skipf("%q doesn't have a way to query its terminal size", testImage)
+	}
+
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), withProcessArgs("/bin/stty", "size"), oci.WithTTY),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	stdout := &bytes.Buffer{}
+
+	task, err := container.NewTask(ctx,
+		cio.NewCreator(cio.WithStreams(nil, stdout, nil), cio.WithTerminal),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	if err := task.Resize(ctx, 12, 34); err != nil {
+		t.Fatal(err)
+	}
+
+	err = task.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	<-statusC
+
+	task.Kill(ctx, syscall.SIGKILL)
+
+	_, err = task.Delete(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	require.Equal(t, "34 12\r\n", stdout.String())
+}
+
+func TestContainerImage(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+	id := t.Name()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	image, err := client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container, err := client.NewContainer(ctx, id, WithNewSpec(), WithImage(image))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx)
+
+	i, err := container.Image(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i.Name() != image.Name() {
+		t.Fatalf("expected container image name %s but received %s", image.Name(), i.Name())
+	}
+}
+
+func TestContainerNoImage(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+	id := t.Name()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	container, err := client.NewContainer(ctx, id, WithNewSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx)
+
+	_, err = container.Image(ctx)
+	if err == nil {
+		t.Fatal("error should not be nil when container is created without an image")
+	}
+	if !errdefs.IsNotFound(err) {
+		t.Fatalf("expected error to be %s but received %s", errdefs.ErrNotFound, err)
+	}
+}
+
+func TestContainerNoSTDIN(t *testing.T) {
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withExitStatus(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(nil, io.Discard, io.Discard)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status := <-statusC
+	code, _, err := status.Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Errorf("expected status 0 from wait but received %d", code)
+	}
+}
+
+func TestTaskSpec(t *testing.T) {
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), longCommand))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	task, err := container.NewTask(ctx, empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := task.Spec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec == nil {
+		t.Fatal("spec from task is nil")
+	}
+	direct, err := newDirectIO(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer direct.Delete()
+
+	lt, err := container.Task(ctx, direct.IOAttach)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err = lt.Spec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec == nil {
+		t.Fatal("spec from loaded task is nil")
+	}
+
+	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	<-statusC
+}
+
+func TestContainerUsername(t *testing.T) {
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	username := "www-data"
+	command := []string{
+		"id", "-u",
+	}
+	expectedOutput := "33"
+	if runtime.GOOS == "windows" {
+		username = "ContainerUser"
+		command = []string{
+			"echo", `%USERNAME%`,
+		}
+		expectedOutput = "ContainerUser"
+	}
+
+	// the www-data user in the busybox image has a uid of 33
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), oci.WithUsername(username), withProcessArgs(command...)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	buf := bytes.NewBuffer(nil)
+	task, err := container.NewTask(ctx, cio.NewCreator(withByteBuffers(buf)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-statusC
+	if _, err := task.Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	output := strings.TrimSuffix(buf.String(), newLine)
+	if output != expectedOutput {
+		t.Errorf("expected %s uid to be %s but received %q", username, expectedOutput, buf.String())
+	}
+}
+
+func TestContainerPTY(t *testing.T) {
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), oci.WithTTY, withProcessArgs("echo", "hello")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	buf := bytes.NewBuffer(nil)
+	task, err := container.NewTask(ctx, cio.NewCreator(withByteBuffers(buf), withProcessTTY()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	<-statusC
+
+	if _, err := task.Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+	if !strings.ContainsAny(fmt.Sprintf("%#q", out), `\x00`) {
+		t.Fatal(`expected \x00 in output`)
 	}
 }

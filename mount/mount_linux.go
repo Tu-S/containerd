@@ -17,13 +17,14 @@
 package mount
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
+	"runtime"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	exec "golang.org/x/sys/execabs"
 	"golang.org/x/sys/unix"
 )
@@ -63,7 +64,7 @@ func (m *Mount) Mount(target string) (err error) {
 
 	flags, data, losetup := parseMountOptions(options)
 	if len(data) > pagesize {
-		return errors.Errorf("mount options is too long")
+		return errors.New("mount options is too long")
 	}
 
 	// propagation types.
@@ -163,7 +164,7 @@ func unmount(target string, flags int) error {
 		}
 		return nil
 	}
-	return errors.Wrapf(unix.EBUSY, "failed to unmount target %s", target)
+	return fmt.Errorf("failed to unmount target %s: %w", target, unix.EBUSY)
 }
 
 // UnmountAll repeatedly unmounts the given mount point until there
@@ -363,21 +364,29 @@ func mountAt(chdir string, source, target, fstype string, flags uintptr, data st
 		return unix.Mount(source, target, fstype, flags, data)
 	}
 
-	f, err := os.Open(chdir)
-	if err != nil {
-		return errors.Wrap(err, "failed to mountat")
-	}
-	defer f.Close()
+	ch := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
 
-	fs, err := f.Stat()
-	if err != nil {
-		return errors.Wrap(err, "failed to mountat")
-	}
+		// Do not unlock this thread.
+		// If the thread is unlocked go will try to use it for other goroutines.
+		// However it is not possible to restore the thread state after CLONE_FS.
+		//
+		// Once the goroutine exits the thread should eventually be terminated by go.
 
-	if !fs.IsDir() {
-		return errors.Wrap(errors.Errorf("%s is not dir", chdir), "failed to mountat")
-	}
-	return errors.Wrap(fMountat(f.Fd(), source, target, fstype, flags, data), "failed to mountat")
+		if err := unix.Unshare(unix.CLONE_FS); err != nil {
+			ch <- err
+			return
+		}
+
+		if err := unix.Chdir(chdir); err != nil {
+			ch <- err
+			return
+		}
+
+		ch <- unix.Mount(source, target, fstype, flags, data)
+	}()
+	return <-ch
 }
 
 func (m *Mount) mountWithHelper(helperBinary, typePrefix, target string) error {
@@ -406,7 +415,7 @@ func (m *Mount) mountWithHelper(helperBinary, typePrefix, target string) error {
 			return nil
 		}
 		if !errors.Is(err, unix.ECHILD) {
-			return errors.Wrapf(err, "mount helper [%s %v] failed: %q", helperBinary, args, string(out))
+			return fmt.Errorf("mount helper [%s %v] failed: %q: %w", helperBinary, args, string(out), err)
 		}
 		// We got ECHILD, we are not sure whether the mount was successful.
 		// If the mount ID has changed, we are sure we got some new mount, but still not sure it is fully completed.
@@ -419,5 +428,5 @@ func (m *Mount) mountWithHelper(helperBinary, typePrefix, target string) error {
 			_ = unmount(target, 0)
 		}
 	}
-	return errors.Errorf("mount helper [%s %v] failed with ECHILD (retired %d times)", helperBinary, args, retriesOnECHILD)
+	return fmt.Errorf("mount helper [%s %v] failed with ECHILD (retired %d times)", helperBinary, args, retriesOnECHILD)
 }

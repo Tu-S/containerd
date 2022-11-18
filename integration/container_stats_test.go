@@ -17,12 +17,13 @@
 package integration
 
 import (
+	"errors"
 	"fmt"
 	goruntime "runtime"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/containerd/containerd/integration/images"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -33,6 +34,7 @@ func TestContainerStats(t *testing.T) {
 	t.Logf("Create a pod config and run sandbox container")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "sandbox1", "stats")
 
+	pauseImage := images.Get(images.Pause)
 	EnsureImageExists(t, pauseImage)
 
 	t.Logf("Create a container config and run container in a pod")
@@ -74,7 +76,7 @@ func TestContainerConsumedStats(t *testing.T) {
 	t.Logf("Create a pod config and run sandbox container")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "sandbox1", "stats")
 
-	testImage := GetImage(ResourceConsumer)
+	testImage := images.Get(images.ResourceConsumer)
 	EnsureImageExists(t, testImage)
 
 	t.Logf("Create a container config and run container in a pod")
@@ -145,6 +147,7 @@ func TestContainerListStats(t *testing.T) {
 	t.Logf("Create a pod config and run sandbox container")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "running-pod", "statsls")
 
+	pauseImage := images.Get(images.Pause)
 	EnsureImageExists(t, pauseImage)
 
 	t.Logf("Create a container config and run containers in a pod")
@@ -199,6 +202,7 @@ func TestContainerListStatsWithIdFilter(t *testing.T) {
 	t.Logf("Create a pod config and run sandbox container")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "running-pod", "statsls")
 
+	pauseImage := images.Get(images.Pause)
 	EnsureImageExists(t, pauseImage)
 
 	t.Logf("Create a container config and run containers in a pod")
@@ -258,6 +262,7 @@ func TestContainerListStatsWithSandboxIdFilter(t *testing.T) {
 	t.Logf("Create a pod config and run sandbox container")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "running-pod", "statsls")
 
+	pauseImage := images.Get(images.Pause)
 	EnsureImageExists(t, pauseImage)
 
 	t.Logf("Create a container config and run containers in a pod")
@@ -292,10 +297,14 @@ func TestContainerListStatsWithSandboxIdFilter(t *testing.T) {
 		if len(stats) != 3 {
 			return false, errors.New("unexpected stats length")
 		}
-		if stats[0].GetWritableLayer().GetUsedBytes().GetValue() != 0 {
-			return true, nil
+
+		for _, containerStats := range stats {
+			// Wait for stats on all containers, not just the first one in the list.
+			if containerStats.GetWritableLayer().GetUsedBytes().GetValue() == 0 {
+				return false, nil
+			}
 		}
-		return false, nil
+		return true, nil
 	}, time.Second, 45*time.Second))
 	// TODO(claudiub): Reduce the timer above to 30 seconds once Windows flakiness has been addressed.
 	t.Logf("Verify container stats for sandbox %q", sb)
@@ -314,6 +323,7 @@ func TestContainerListStatsWithIdSandboxIdFilter(t *testing.T) {
 	t.Logf("Create a pod config and run sandbox container")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "running-pod", "statsls")
 
+	pauseImage := images.Get(images.Pause)
 	EnsureImageExists(t, pauseImage)
 
 	t.Logf("Create container config and run containers in a pod")
@@ -368,7 +378,7 @@ func TestContainerListStatsWithIdSandboxIdFilter(t *testing.T) {
 				return false, err
 			}
 			if len(stats) != 1 {
-				return false, errors.New("unexpected stats length")
+				return false, fmt.Errorf("expected only one stat, but got %v", stats)
 			}
 			if stats[0].GetWritableLayer().GetUsedBytes().GetValue() != 0 {
 				return true, nil

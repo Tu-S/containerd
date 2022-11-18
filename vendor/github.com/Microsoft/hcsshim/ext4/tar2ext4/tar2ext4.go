@@ -4,11 +4,15 @@ import (
 	"archive/tar"
 	"bufio"
 	"encoding/binary"
+	"fmt"
+	"github.com/pkg/errors"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 
+	"github.com/Microsoft/hcsshim/ext4/dmverity"
 	"github.com/Microsoft/hcsshim/ext4/internal/compactext4"
 	"github.com/Microsoft/hcsshim/ext4/internal/format"
 )
@@ -16,6 +20,7 @@ import (
 type params struct {
 	convertWhiteout bool
 	appendVhdFooter bool
+	appendDMVerity  bool
 	ext4opts        []compactext4.Option
 }
 
@@ -32,6 +37,12 @@ func ConvertWhiteout(p *params) {
 // file.
 func AppendVhdFooter(p *params) {
 	p.appendVhdFooter = true
+}
+
+// AppendDMVerity instructs the converter to add a dmverity merkle tree for
+// the ext4 filesystem after the filesystem and before the optional VHD footer
+func AppendDMVerity(p *params) {
+	p.appendDMVerity = true
 }
 
 // InlineData instructs the converter to write small files into the inode
@@ -55,13 +66,14 @@ const (
 	opaqueWhiteout = ".wh..wh..opq"
 )
 
-// Convert writes a compact ext4 file system image that contains the files in the
+// ConvertTarToExt4 writes a compact ext4 file system image that contains the files in the
 // input tar stream.
-func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
+func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 	var p params
 	for _, opt := range options {
 		opt(&p)
 	}
+
 	t := tar.NewReader(bufio.NewReader(r))
 	fs := compactext4.NewWriter(w, p.ext4opts...)
 	for {
@@ -73,6 +85,10 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 			return err
 		}
 
+		if err = fs.MakeParents(hdr.Name); err != nil {
+			return errors.Wrapf(err, "failed to ensure parent directories for %s", hdr.Name)
+		}
+
 		if p.convertWhiteout {
 			dir, name := path.Split(hdr.Name)
 			if strings.HasPrefix(name, whiteoutPrefix) {
@@ -80,12 +96,12 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 					// Update the directory with the appropriate xattr.
 					f, err := fs.Stat(dir)
 					if err != nil {
-						return err
+						return errors.Wrapf(err, "failed to stat parent directory of whiteout %s", hdr.Name)
 					}
 					f.Xattrs["trusted.overlay.opaque"] = []byte("y")
 					err = fs.Create(dir, f)
 					if err != nil {
-						return err
+						return errors.Wrapf(err, "failed to create opaque dir %s", hdr.Name)
 					}
 				} else {
 					// Create an overlay-style whiteout.
@@ -96,7 +112,7 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 					}
 					err = fs.Create(path.Join(dir, name[len(whiteoutPrefix):]), f)
 					if err != nil {
-						return err
+						return errors.Wrapf(err, "failed to create whiteout file for %s", hdr.Name)
 					}
 				}
 
@@ -148,7 +164,7 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 			}
 			f.Mode &= ^compactext4.TypeMask
 			f.Mode |= typ
-			err = fs.CreateWithParents(hdr.Name, f)
+			err = fs.Create(hdr.Name, f)
 			if err != nil {
 				return err
 			}
@@ -158,19 +174,29 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 			}
 		}
 	}
-	err := fs.Close()
-	if err != nil {
+	return fs.Close()
+}
+
+// Convert wraps ConvertTarToExt4 and conditionally computes (and appends) the file image's cryptographic
+// hashes (merkle tree) or/and appends a VHD footer.
+func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
+	var p params
+	for _, opt := range options {
+		opt(&p)
+	}
+
+	if err := ConvertTarToExt4(r, w, options...); err != nil {
 		return err
 	}
+
+	if p.appendDMVerity {
+		if err := dmverity.ComputeAndWriteHashDevice(w, w); err != nil {
+			return err
+		}
+	}
+
 	if p.appendVhdFooter {
-		size, err := w.Seek(0, io.SeekEnd)
-		if err != nil {
-			return err
-		}
-		err = binary.Write(w, binary.BigEndian, makeFixedVHDFooter(size))
-		if err != nil {
-			return err
-		}
+		return ConvertToVhd(w)
 	}
 	return nil
 }
@@ -205,5 +231,52 @@ func ReadExt4SuperBlock(vhdPath string) (*format.SuperBlock, error) {
 	if err := binary.Read(vhd, binary.LittleEndian, &sb); err != nil {
 		return nil, err
 	}
+	// Make sure the magic bytes are correct.
+	if sb.Magic != format.SuperBlockMagic {
+		return nil, errors.New("not an ext4 file system")
+	}
 	return &sb, nil
+}
+
+// ConvertAndComputeRootDigest writes a compact ext4 file system image that contains the files in the
+// input tar stream, computes the resulting file image's cryptographic hashes (merkle tree) and returns
+// merkle tree root digest. Convert is called with minimal options: ConvertWhiteout and MaximumDiskSize
+// set to dmverity.RecommendedVHDSizeGB.
+func ConvertAndComputeRootDigest(r io.Reader) (string, error) {
+	out, err := ioutil.TempFile("", "")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary file: %s", err)
+	}
+	defer func() {
+		_ = os.Remove(out.Name())
+	}()
+
+	options := []Option{
+		ConvertWhiteout,
+		MaximumDiskSize(dmverity.RecommendedVHDSizeGB),
+	}
+	if err := ConvertTarToExt4(r, out, options...); err != nil {
+		return "", fmt.Errorf("failed to convert tar to ext4: %s", err)
+	}
+
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("failed to seek start on temp file when creating merkle tree: %s", err)
+	}
+
+	tree, err := dmverity.MerkleTree(bufio.NewReaderSize(out, dmverity.MerkleTreeBufioSize))
+	if err != nil {
+		return "", fmt.Errorf("failed to create merkle tree: %s", err)
+	}
+
+	hash := dmverity.RootHash(tree)
+	return fmt.Sprintf("%x", hash), nil
+}
+
+// ConvertToVhd converts given io.WriteSeeker to VHD, by appending the VHD footer with a fixed size.
+func ConvertToVhd(w io.WriteSeeker) error {
+	size, err := w.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, makeFixedVHDFooter(size))
 }

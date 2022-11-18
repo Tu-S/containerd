@@ -23,8 +23,9 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/pkg/cri/store"
 	"github.com/containerd/containerd/pkg/cri/store/label"
-	"github.com/containerd/containerd/pkg/cri/store/truncindex"
+	"github.com/containerd/containerd/pkg/cri/store/stats"
 	"github.com/containerd/containerd/pkg/netns"
+	"github.com/containerd/containerd/pkg/truncindex"
 )
 
 // Sandbox contains all resources associated with the sandbox. All methods to
@@ -42,6 +43,8 @@ type Sandbox struct {
 	NetNS *netns.NetNS
 	// StopCh is used to propagate the stop information of the sandbox.
 	*store.StopCh
+	// Stats contains (mutable) stats for the (pause) sandbox container
+	Stats *stats.ContainerStats
 }
 
 // NewSandbox creates an internally used sandbox type. This functions reminds
@@ -75,7 +78,8 @@ func NewStore(labels *label.Store) *Store {
 	}
 }
 
-// Add a sandbox into the store.
+// Add a sandbox into the store. Returns errdefs.ErrAlreadyExists if the sandbox is
+// already stored.
 func (s *Store) Add(sb Sandbox) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -93,7 +97,7 @@ func (s *Store) Add(sb Sandbox) error {
 }
 
 // Get returns the sandbox with specified id.
-// Returns store.ErrNotExist if the sandbox doesn't exist.
+// Returns errdefs.ErrNotFound if the sandbox doesn't exist.
 func (s *Store) Get(id string) (Sandbox, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
@@ -121,6 +125,30 @@ func (s *Store) List() []Sandbox {
 	return sandboxes
 }
 
+// UpdateContainerStats updates the sandbox specified by ID with the
+// stats present in 'newContainerStats'. Returns errdefs.ErrNotFound
+// if the sandbox does not exist in the store.
+func (s *Store) UpdateContainerStats(id string, newContainerStats *stats.ContainerStats) error {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	id, err := s.idIndex.Get(id)
+	if err != nil {
+		if err == truncindex.ErrNotExist {
+			err = errdefs.ErrNotFound
+		}
+		return err
+	}
+
+	if _, ok := s.sandboxes[id]; !ok {
+		return errdefs.ErrNotFound
+	}
+
+	c := s.sandboxes[id]
+	c.Stats = newContainerStats
+	s.sandboxes[id] = c
+	return nil
+}
+
 // Delete deletes the sandbox with specified id.
 func (s *Store) Delete(id string) {
 	s.lock.Lock()
@@ -132,6 +160,6 @@ func (s *Store) Delete(id string) {
 		return
 	}
 	s.labels.Release(s.sandboxes[id].ProcessLabel)
-	s.idIndex.Delete(id) // nolint: errcheck
+	s.idIndex.Delete(id)
 	delete(s.sandboxes, id)
 }
