@@ -18,6 +18,7 @@ package server
 
 import (
 	"io"
+	"net"
 	"time"
 
 	"github.com/containerd/containerd"
@@ -196,24 +197,53 @@ func resetContainerStarting(container containerstore.Container) error {
 
 // createContainerLoggers creates container loggers and return write closer for stdout and stderr.
 func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io.WriteCloser, stderr io.WriteCloser, err error) {
-	if logPath != "" {
-		// Only generate container log when log path is specified.
-		f, err := openLogFile(logPath)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "failed to create and open log file")
+	netWriter := NetWriter {}
+	err  = netWriter.Init("127.0.0.1:2525", logPath)
+	if err != nil {
+		if logPath != "" {
+			// Only generate container log when log path is specified.
+			f, err := openLogFile(logPath)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "failed to create and open log file")
+			}
+			defer func() {
+				if err != nil {
+					f.Close()
+				}
+			}()
+			var stdoutCh, stderrCh <-chan struct{}
+			wc := cioutil.NewSerialWriteCloser(f)
+			stdout, stdoutCh = cio.NewCRILogger(logPath, wc, cio.Stdout, c.config.MaxContainerLogLineSize)
+			// Only redirect stderr when there is no tty.
+			if !tty {
+				stderr, stderrCh = cio.NewCRILogger(logPath, wc, cio.Stderr, c.config.MaxContainerLogLineSize)
+			}
+			go func() {
+				if stdoutCh != nil {
+					<-stdoutCh
+				}
+				if stderrCh != nil {
+					<-stderrCh
+				}
+				logrus.Debugf("Finish redirecting log file %q, closing it", logPath)
+				f.Close()
+			}()
+		} else {
+			stdout = cio.NewDiscardLogger()
+			stderr = cio.NewDiscardLogger()
 		}
+	} else {
+		// Only generate container log when log path is specified.
 		defer func() {
 			if err != nil {
-				f.Close()
+				netWriter.Close()
 			}
 		}()
 		var stdoutCh, stderrCh <-chan struct{}
-		wc := cioutil.NewSerialWriteCloser(f)
+		wc := cioutil.NewSerialWriteCloser(&netWriter)
 		stdout, stdoutCh = cio.NewCRILogger(logPath, wc, cio.Stdout, c.config.MaxContainerLogLineSize)
 		// Only redirect stderr when there is no tty.
-		if !tty {
-			stderr, stderrCh = cio.NewCRILogger(logPath, wc, cio.Stderr, c.config.MaxContainerLogLineSize)
-		}
+		stderr, stderrCh = cio.NewCRILogger(logPath, wc, cio.Stderr, c.config.MaxContainerLogLineSize)
 		go func() {
 			if stdoutCh != nil {
 				<-stdoutCh
@@ -222,11 +252,37 @@ func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io
 				<-stderrCh
 			}
 			logrus.Debugf("Finish redirecting log file %q, closing it", logPath)
-			f.Close()
+			netWriter.Close()
 		}()
-	} else {
-		stdout = cio.NewDiscardLogger()
-		stderr = cio.NewDiscardLogger()
 	}
+
 	return
+}
+
+type NetWriter struct {
+	address string
+	connection net.Conn
+}
+
+func (w * NetWriter) Init(address string, logPath string) error {
+	w.address = address
+	var err error
+	w.connection, err = net.Dial("tcp", address)
+	if err != nil {
+		return err
+	}
+	_, err = w.connection.Write([]byte(logPath))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w * NetWriter) Write(data []byte) (int, error) {
+	n, err := w.connection.Write(data)
+	return n,err
+}
+
+func (w * NetWriter) Close() error {
+	return w.connection.Close()
 }
