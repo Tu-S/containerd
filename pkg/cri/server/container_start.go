@@ -17,12 +17,13 @@
 package server
 
 import (
+	containerdio "github.com/containerd/containerd/cio"
 	"io"
 	"net"
+	"os"
 	"time"
 
 	"github.com/containerd/containerd"
-	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/nri"
@@ -197,9 +198,19 @@ func resetContainerStarting(container containerstore.Container) error {
 
 // createContainerLoggers creates container loggers and return write closer for stdout and stderr.
 func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io.WriteCloser, stderr io.WriteCloser, err error) {
+	file, errr := os.OpenFile("/home/sergey/Studing/containers/debug/debug.txt", os.O_WRONLY, os.ModeType)
+	if errr != nil {
+		return nil, nil ,errors.Wrap(err, "failed to open file for debug")
+	}
+	file.Seek(0, io.SeekEnd)
+	file.WriteString("\n\n--Зашли в метод и открыли файл \n")
+	defer file.Close()
 	netWriter := NetWriter {}
 	err  = netWriter.Init("127.0.0.1:2525", logPath)
+	file.WriteString("Ошибка создания конекшена: " + err.Error())
 	if err != nil {
+		return nil, nil, errors.Wrap(err, " ОШИБКА СОЗДАНИЯ КОНЕКШЕНА ")
+		os.Stderr.WriteString("ОШИБКА СОЗДАНИЯ КОНЕКШЕНА: " + err.Error() + "\n")
 		if logPath != "" {
 			// Only generate container log when log path is specified.
 			f, err := openLogFile(logPath)
@@ -233,6 +244,7 @@ func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io
 			stderr = cio.NewDiscardLogger()
 		}
 	} else {
+		file.WriteString("Ошибки нет, зашли в создание NewCRILogger\n")
 		// Only generate container log when log path is specified.
 		defer func() {
 			if err != nil {
@@ -255,7 +267,7 @@ func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io
 			netWriter.Close()
 		}()
 	}
-
+	file.WriteString("В конце метода\n")
 	return
 }
 
