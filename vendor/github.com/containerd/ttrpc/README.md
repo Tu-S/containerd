@@ -1,6 +1,7 @@
 # ttrpc
 
-[![Build Status](https://travis-ci.org/containerd/ttrpc.svg?branch=master)](https://travis-ci.org/containerd/ttrpc)
+[![Build Status](https://github.com/containerd/ttrpc/workflows/CI/badge.svg)](https://github.com/containerd/ttrpc/actions?query=workflow%3ACI)
+[![codecov](https://codecov.io/gh/containerd/ttrpc/branch/main/graph/badge.svg)](https://codecov.io/gh/containerd/ttrpc)
 
 GRPC for low-memory environments.
 
@@ -18,6 +19,10 @@ the same ease of use as GRPC.
 Please note that while this project supports generating either end of the
 protocol, the generated service definitions will be incompatible with regular
 GRPC services, as they do not speak the same protocol.
+
+# Protocol
+
+See the [protocol specification](./PROTOCOL.md).
 
 # Usage
 
@@ -40,14 +45,8 @@ directly, if required.
 
 # Status
 
-Very new. YMMV.
-
 TODO:
 
-- [X] Plumb error codes and GRPC status
-- [X] Remove use of any type and dependency on typeurl package
-- [X] Ensure that protocol can support streaming in the future
-- [ ] Document protocol layout
 - [ ] Add testing under concurrent load to ensure
 - [ ] Verify connection error handling
 
@@ -55,8 +54,8 @@ TODO:
 
 ttrpc is a containerd sub-project, licensed under the [Apache 2.0 license](./LICENSE).
 As a containerd sub-project, you will find the:
- * [Project governance](https://github.com/containerd/project/blob/master/GOVERNANCE.md),
- * [Maintainers](https://github.com/containerd/project/blob/master/MAINTAINERS),
- * and [Contributing guidelines](https://github.com/containerd/project/blob/master/CONTRIBUTING.md)
+ * [Project governance](https://github.com/containerd/project/blob/main/GOVERNANCE.md),
+ * [Maintainers](https://github.com/containerd/project/blob/main/MAINTAINERS),
+ * and [Contributing guidelines](https://github.com/containerd/project/blob/main/CONTRIBUTING.md)
 
 information in our [`containerd/project`](https://github.com/containerd/project) repository.

@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
 
 	internalapi "github.com/containerd/containerd/integration/cri-api/pkg/apis"
@@ -73,7 +74,11 @@ func NewRuntimeService(endpoint string, connectionTimeout time.Duration) (intern
 	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithContextDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
+	conn, err := grpc.DialContext(ctx, addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(dialer),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)),
+	)
 	if err != nil {
 		klog.Errorf("Connect remote runtime %s failed: %v", addr, err)
 		return nil, err
@@ -361,7 +366,7 @@ func (r *RuntimeService) ContainerStatus(containerID string, opts ...grpc.CallOp
 }
 
 // UpdateContainerResources updates a containers resource config
-func (r *RuntimeService) UpdateContainerResources(containerID string, resources *runtimeapi.LinuxContainerResources, opts ...grpc.CallOption) error {
+func (r *RuntimeService) UpdateContainerResources(containerID string, resources *runtimeapi.LinuxContainerResources, windowsResources *runtimeapi.WindowsContainerResources, opts ...grpc.CallOption) error {
 	klog.V(10).Infof("[RuntimeService] UpdateContainerResources (containerID=%v, timeout=%v)", containerID, r.timeout)
 	ctx, cancel := getContextWithTimeout(r.timeout)
 	defer cancel()
@@ -369,6 +374,7 @@ func (r *RuntimeService) UpdateContainerResources(containerID string, resources 
 	_, err := r.runtimeClient.UpdateContainerResources(ctx, &runtimeapi.UpdateContainerResourcesRequest{
 		ContainerId: containerID,
 		Linux:       resources,
+		Windows:     windowsResources,
 	}, opts...)
 	if err != nil {
 		klog.Errorf("UpdateContainerResources %q from runtime service failed: %v", containerID, err)

@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 // generateData generates data that composed of 2 random parts
 // and single zero-filled part within them.
 // Typically, the compression ratio would be about 67%.
-func generateData(t *testing.T, size int) []byte {
+func generateData(t testing.TB, size int) []byte {
 	part0 := size / 3             // random
 	part2 := size / 3             // random
 	part1 := size - part0 - part2 // zero-filled
@@ -56,8 +56,8 @@ func generateData(t *testing.T, size int) []byte {
 	return append(part0Data, append(part1Data, part2Data...)...)
 }
 
-func testCompressDecompress(t *testing.T, size int, compression Compression) DecompressReadCloser {
-	orig := generateData(t, size)
+func testCompress(t testing.TB, orig []byte, compression Compression) []byte {
+	size := len(orig)
 	var b bytes.Buffer
 	compressor, err := CompressStream(&b, compression)
 	if err != nil {
@@ -67,14 +67,11 @@ func testCompressDecompress(t *testing.T, size int, compression Compression) Dec
 		t.Fatal(err)
 	}
 	compressor.Close()
-	compressed := b.Bytes()
-	t.Logf("compressed %d bytes to %d bytes (%.2f%%)",
-		len(orig), len(compressed), 100.0*float32(len(compressed))/float32(len(orig)))
-	if compared := bytes.Compare(orig, compressed); (compression == Uncompressed && compared != 0) ||
-		(compression != Uncompressed && compared == 0) {
-		t.Fatal("strange compressed data")
-	}
 
+	return b.Bytes()
+}
+
+func testDecompress(t testing.TB, compressed []byte) ([]byte, DecompressReadCloser) {
 	decompressor, err := DecompressStream(bytes.NewReader(compressed))
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +80,20 @@ func testCompressDecompress(t *testing.T, size int, compression Compression) Dec
 	if err != nil {
 		t.Fatal(err)
 	}
+	return decompressed, decompressor
+}
+
+func testCompressDecompress(t testing.TB, size int, compression Compression) DecompressReadCloser {
+	orig := generateData(t, size)
+	compressed := testCompress(t, orig, compression)
+	t.Logf("compressed %d bytes to %d bytes (%.2f%%)",
+		len(orig), len(compressed), 100.0*float32(len(compressed))/float32(len(orig)))
+	if compared := bytes.Compare(orig, compressed); (compression == Uncompressed && compared != 0) ||
+		(compression != Uncompressed && compared == 0) {
+		t.Fatal("strange compressed data")
+	}
+
+	decompressed, decompressor := testDecompress(t, compressed)
 	if !bytes.Equal(orig, decompressed) {
 		t.Fatal("strange decompressed data")
 	}
@@ -122,10 +133,7 @@ func TestCompressDecompressUncompressed(t *testing.T) {
 
 func TestDetectPigz(t *testing.T) {
 	// Create fake PATH with unpigz executable, make sure detectPigz can find it
-	tempPath, err := os.MkdirTemp("", "containerd_temp_")
-	if err != nil {
-		t.Fatal(err)
-	}
+	tempPath := t.TempDir()
 
 	filename := "unpigz"
 	if runtime.GOOS == "windows" {
@@ -138,11 +146,7 @@ func TestDetectPigz(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	defer os.RemoveAll(tempPath)
-
-	oldPath := os.Getenv("PATH")
-	os.Setenv("PATH", tempPath)
-	defer os.Setenv("PATH", oldPath)
+	t.Setenv("PATH", tempPath)
 
 	if pigzPath := detectPigz(); pigzPath == "" {
 		t.Fatal("failed to detect pigz path")
@@ -150,8 +154,7 @@ func TestDetectPigz(t *testing.T) {
 		t.Fatalf("wrong pigz found: %s != %s", pigzPath, fullPath)
 	}
 
-	os.Setenv(disablePigzEnv, "1")
-	defer os.Unsetenv(disablePigzEnv)
+	t.Setenv(disablePigzEnv, "1")
 
 	if pigzPath := detectPigz(); pigzPath != "" {
 		t.Fatalf("disable via %s doesn't work", disablePigzEnv)
@@ -186,5 +189,41 @@ func TestCmdStreamBad(t *testing.T) {
 		t.Fatalf("wrong error: %s", err.Error())
 	} else if string(buf) != "hello\n" {
 		t.Fatalf("wrong output: %s", string(buf))
+	}
+}
+
+func TestDetectCompressionZstd(t *testing.T) {
+	for _, tc := range []struct {
+		source   []byte
+		expected Compression
+	}{
+		{
+			// test zstd compression without skippable frames.
+			source: []byte{
+				0x28, 0xb5, 0x2f, 0xfd, // magic number of Zstandard frame: 0xFD2FB528
+				0x04, 0x00, 0x31, 0x00, 0x00, // frame header
+				0x64, 0x6f, 0x63, 0x6b, 0x65, 0x72, // data block "docker"
+				0x16, 0x0e, 0x21, 0xc3, // content checksum
+			},
+			expected: Zstd,
+		},
+		{
+			// test zstd compression with skippable frames.
+			source: []byte{
+				0x50, 0x2a, 0x4d, 0x18, // magic number of skippable frame: 0x184D2A50 to 0x184D2A5F
+				0x04, 0x00, 0x00, 0x00, // frame size
+				0x5d, 0x00, 0x00, 0x00, // user data
+				0x28, 0xb5, 0x2f, 0xfd, // magic number of Zstandard frame: 0xFD2FB528
+				0x04, 0x00, 0x31, 0x00, 0x00, // frame header
+				0x64, 0x6f, 0x63, 0x6b, 0x65, 0x72, // data block "docker"
+				0x16, 0x0e, 0x21, 0xc3, // content checksum
+			},
+			expected: Zstd,
+		},
+	} {
+		compression := DetectCompression(tc.source)
+		if compression != tc.expected {
+			t.Fatalf("Unexpected compression %v, expected %v", compression, tc.expected)
+		}
 	}
 }

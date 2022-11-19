@@ -17,6 +17,8 @@
 package images
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 
@@ -24,7 +26,6 @@ import (
 	"github.com/containerd/containerd/images/archive"
 	"github.com/containerd/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 )
 
@@ -73,13 +74,13 @@ When '--all-platforms' is given all images in a manifest list must be available.
 			for _, ps := range pss {
 				p, err := platforms.Parse(ps)
 				if err != nil {
-					return errors.Wrapf(err, "invalid platform %q", ps)
+					return fmt.Errorf("invalid platform %q: %w", ps, err)
 				}
 				all = append(all, p)
 			}
 			exportOpts = append(exportOpts, archive.WithPlatform(platforms.Ordered(all...)))
 		} else {
-			exportOpts = append(exportOpts, archive.WithPlatform(platforms.Default()))
+			exportOpts = append(exportOpts, archive.WithPlatform(platforms.DefaultStrict()))
 		}
 
 		if context.Bool("all-platforms") {

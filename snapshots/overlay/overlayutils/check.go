@@ -24,11 +24,11 @@ import (
 	"os"
 	"path/filepath"
 
+	kernel "github.com/containerd/containerd/contrib/seccomp/kernelversion"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/continuity/fs"
-	"github.com/pkg/errors"
 )
 
 // SupportsMultipleLowerDir checks if the system supports multiple lowerdirs,
@@ -63,7 +63,7 @@ func SupportsMultipleLowerDir(d string) error {
 	}
 	dest := filepath.Join(td, "merged")
 	if err := m.Mount(dest); err != nil {
-		return errors.Wrap(err, "failed to mount overlay")
+		return fmt.Errorf("failed to mount overlay: %w", err)
 	}
 	if err := mount.UnmountAll(dest, 0); err != nil {
 		log.L.WithError(err).Warnf("Failed to unmount check directory %v", dest)
@@ -114,10 +114,14 @@ func NeedsUserXAttr(d string) (bool, error) {
 		return false, nil
 	}
 
-	// TODO: add fast path for kernel >= 5.11 .
+	// Fast path on kernels >= 5.11
 	//
-	// Keep in mind that distro vendors might be going to backport the patch to older kernels.
-	// So we can't completely remove the check.
+	// Keep in mind that distro vendors might be going to backport the patch to older kernels
+	// so we can't completely remove the "slow path".
+	fiveDotEleven := kernel.KernelVersion{Kernel: 5, Major: 11}
+	if ok, err := kernel.GreaterEqualThan(fiveDotEleven); err == nil && ok {
+		return true, nil
+	}
 
 	tdRoot := filepath.Join(d, "userxattr-check")
 	if err := os.RemoveAll(tdRoot); err != nil {
@@ -146,7 +150,7 @@ func NeedsUserXAttr(d string) (bool, error) {
 	}
 
 	opts := []string{
-		fmt.Sprintf("lowerdir=%s:%s,upperdir=%s,workdir=%s", filepath.Join(td, "lower2"), filepath.Join(td, "lower1"), filepath.Join(td, "upper"), filepath.Join(td, "work")),
+		fmt.Sprintf("ro,lowerdir=%s:%s,upperdir=%s,workdir=%s", filepath.Join(td, "lower2"), filepath.Join(td, "lower1"), filepath.Join(td, "upper"), filepath.Join(td, "work")),
 		"userxattr",
 	}
 

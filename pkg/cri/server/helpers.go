@@ -17,6 +17,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/errdefs"
+	clabels "github.com/containerd/containerd/labels"
 	criconfig "github.com/containerd/containerd/pkg/cri/config"
 	containerstore "github.com/containerd/containerd/pkg/cri/store/container"
 	imagestore "github.com/containerd/containerd/pkg/cri/store/image"
@@ -36,12 +38,12 @@ import (
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/typeurl"
+	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 
 	runhcsoptions "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	imagedigest "github.com/opencontainers/go-digest"
 	"github.com/pelletier/go-toml"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -90,6 +92,9 @@ const (
 
 	// runtimeRunhcsV1 is the runtime type for runhcs.
 	runtimeRunhcsV1 = "io.containerd.runhcs.v1"
+
+	// name prefix for CRI server specific spans
+	criSpanPrefix = "pkg.cri.server"
 )
 
 // makeSandboxName generates sandbox name from sandbox metadata. The name
@@ -108,11 +113,11 @@ func makeSandboxName(s *runtime.PodSandboxMetadata) string {
 // unique.
 func makeContainerName(c *runtime.ContainerMetadata, s *runtime.PodSandboxMetadata) string {
 	return strings.Join([]string{
-		c.Name,                       // 0
+		c.Name,                       // 0: container name
 		s.Name,                       // 1: pod name
 		s.Namespace,                  // 2: pod namespace
 		s.Uid,                        // 3: pod uid
-		fmt.Sprintf("%d", c.Attempt), // 4
+		fmt.Sprintf("%d", c.Attempt), // 4: attempt number of creating the container
 	}, nameDelimiter)
 }
 
@@ -161,7 +166,7 @@ func getRepoDigestAndTag(namedRef docker.Named, digest imagedigest.Digest, schem
 }
 
 // localResolve resolves image reference locally and returns corresponding image metadata. It
-// returns store.ErrNotExist if the reference doesn't exist.
+// returns errdefs.ErrNotFound if the reference doesn't exist.
 func (c *criService) localResolve(refOrID string) (imagestore.Image, error) {
 	getImageID := func(refOrId string) string {
 		if _, err := imagedigest.Parse(refOrID); err == nil {
@@ -194,7 +199,7 @@ func (c *criService) localResolve(refOrID string) (imagestore.Image, error) {
 func (c *criService) toContainerdImage(ctx context.Context, image imagestore.Image) (containerd.Image, error) {
 	// image should always have at least one reference.
 	if len(image.References) == 0 {
-		return nil, errors.Errorf("invalid image with no reference %q", image.ID)
+		return nil, fmt.Errorf("invalid image with no reference %q", image.ID)
 	}
 	return c.client.GetImage(ctx, image.References[0])
 }
@@ -223,7 +228,7 @@ func getUserFromImage(user string) (*int64, string) {
 func (c *criService) ensureImageExists(ctx context.Context, ref string, config *runtime.PodSandboxConfig) (*imagestore.Image, error) {
 	image, err := c.localResolve(ref)
 	if err != nil && !errdefs.IsNotFound(err) {
-		return nil, errors.Wrapf(err, "failed to get image %q", ref)
+		return nil, fmt.Errorf("failed to get image %q: %w", ref, err)
 	}
 	if err == nil {
 		return &image, nil
@@ -231,13 +236,13 @@ func (c *criService) ensureImageExists(ctx context.Context, ref string, config *
 	// Pull image to ensure the image exists
 	resp, err := c.PullImage(ctx, &runtime.PullImageRequest{Image: &runtime.ImageSpec{Image: ref}, SandboxConfig: config})
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to pull image %q", ref)
+		return nil, fmt.Errorf("failed to pull image %q: %w", ref, err)
 	}
 	imageID := resp.GetImageRef()
 	newImage, err := c.imageStore.Get(imageID)
 	if err != nil {
 		// It's still possible that someone removed the image right after it is pulled.
-		return nil, errors.Wrapf(err, "failed to get image %q after pulling", imageID)
+		return nil, fmt.Errorf("failed to get image %q after pulling: %w", imageID, err)
 	}
 	return &newImage, nil
 }
@@ -249,18 +254,18 @@ func (c *criService) ensureImageExists(ctx context.Context, ref string, config *
 func (c *criService) validateTargetContainer(sandboxID, targetContainerID string) (containerstore.Container, error) {
 	targetContainer, err := c.containerStore.Get(targetContainerID)
 	if err != nil {
-		return containerstore.Container{}, errors.Wrapf(err, "container %q does not exist", targetContainerID)
+		return containerstore.Container{}, fmt.Errorf("container %q does not exist: %w", targetContainerID, err)
 	}
 
 	targetSandboxID := targetContainer.Metadata.SandboxID
 	if targetSandboxID != sandboxID {
 		return containerstore.Container{},
-			errors.Errorf("container %q (sandbox %s) does not belong to sandbox %s", targetContainerID, targetSandboxID, sandboxID)
+			fmt.Errorf("container %q (sandbox %s) does not belong to sandbox %s", targetContainerID, targetSandboxID, sandboxID)
 	}
 
 	status := targetContainer.Status.Get()
 	if state := status.State(); state != runtime.ContainerState_CONTAINER_RUNNING {
-		return containerstore.Container{}, errors.Errorf("container %q is not running - in state %s", targetContainerID, state)
+		return containerstore.Container{}, fmt.Errorf("container %q is not running - in state %s", targetContainerID, state)
 	}
 
 	return targetContainer, nil
@@ -285,8 +290,15 @@ func filterLabel(k, v string) string {
 // buildLabel builds the labels from config to be passed to containerd
 func buildLabels(configLabels, imageConfigLabels map[string]string, containerType string) map[string]string {
 	labels := make(map[string]string)
+
 	for k, v := range imageConfigLabels {
-		labels[k] = v
+		if err := clabels.Validate(k, v); err == nil {
+			labels[k] = v
+		} else {
+			// In case the image label is invalid, we output a warning and skip adding it to the
+			// container.
+			logrus.WithError(err).Warnf("unable to add image label with key %s to the container", k)
+		}
 	}
 	// labels from the CRI request (config) will override labels in the image config
 	for k, v := range configLabels {
@@ -366,10 +378,11 @@ func getRuntimeOptionsType(t string) interface{} {
 
 // getRuntimeOptions get runtime options from container metadata.
 func getRuntimeOptions(c containers.Container) (interface{}, error) {
-	if c.Runtime.Options == nil {
+	from := c.Runtime.Options
+	if from == nil || from.GetValue() == nil {
 		return nil, nil
 	}
-	opts, err := typeurl.UnmarshalAny(c.Runtime.Options)
+	opts, err := typeurl.UnmarshalAny(from)
 	if err != nil {
 		return nil, err
 	}
@@ -419,4 +432,84 @@ func getPassthroughAnnotations(podAnnotations map[string]string,
 		}
 	}
 	return passthroughAnnotations
+}
+
+// copyResourcesToStatus copys container resource contraints from spec to
+// container status.
+// This will need updates when new fields are added to ContainerResources.
+func copyResourcesToStatus(spec *runtimespec.Spec, status containerstore.Status) containerstore.Status {
+	status.Resources = &runtime.ContainerResources{}
+	if spec.Linux != nil {
+		status.Resources.Linux = &runtime.LinuxContainerResources{}
+
+		if spec.Process != nil && spec.Process.OOMScoreAdj != nil {
+			status.Resources.Linux.OomScoreAdj = int64(*spec.Process.OOMScoreAdj)
+		}
+
+		if spec.Linux.Resources == nil {
+			return status
+		}
+
+		if spec.Linux.Resources.CPU != nil {
+			if spec.Linux.Resources.CPU.Period != nil {
+				status.Resources.Linux.CpuPeriod = int64(*spec.Linux.Resources.CPU.Period)
+			}
+			if spec.Linux.Resources.CPU.Quota != nil {
+				status.Resources.Linux.CpuQuota = *spec.Linux.Resources.CPU.Quota
+			}
+			if spec.Linux.Resources.CPU.Shares != nil {
+				status.Resources.Linux.CpuShares = int64(*spec.Linux.Resources.CPU.Shares)
+			}
+			status.Resources.Linux.CpusetCpus = spec.Linux.Resources.CPU.Cpus
+			status.Resources.Linux.CpusetMems = spec.Linux.Resources.CPU.Mems
+		}
+
+		if spec.Linux.Resources.Memory != nil {
+			if spec.Linux.Resources.Memory.Limit != nil {
+				status.Resources.Linux.MemoryLimitInBytes = *spec.Linux.Resources.Memory.Limit
+			}
+			if spec.Linux.Resources.Memory.Swap != nil {
+				status.Resources.Linux.MemorySwapLimitInBytes = *spec.Linux.Resources.Memory.Swap
+			}
+		}
+
+		if spec.Linux.Resources.HugepageLimits != nil {
+			hugepageLimits := make([]*runtime.HugepageLimit, 0)
+			for _, l := range spec.Linux.Resources.HugepageLimits {
+				hugepageLimits = append(hugepageLimits, &runtime.HugepageLimit{
+					PageSize: l.Pagesize,
+					Limit:    l.Limit,
+				})
+			}
+			status.Resources.Linux.HugepageLimits = hugepageLimits
+		}
+
+		if spec.Linux.Resources.Unified != nil {
+			status.Resources.Linux.Unified = spec.Linux.Resources.Unified
+		}
+	}
+
+	if spec.Windows != nil {
+		status.Resources.Windows = &runtime.WindowsContainerResources{}
+		if spec.Windows.Resources == nil {
+			return status
+		}
+
+		if spec.Windows.Resources.CPU != nil {
+			if spec.Windows.Resources.CPU.Shares != nil {
+				status.Resources.Windows.CpuShares = int64(*spec.Windows.Resources.CPU.Shares)
+				status.Resources.Windows.CpuCount = int64(*spec.Windows.Resources.CPU.Count)
+				status.Resources.Windows.CpuMaximum = int64(*spec.Windows.Resources.CPU.Maximum)
+			}
+		}
+
+		if spec.Windows.Resources.Memory != nil {
+			if spec.Windows.Resources.Memory.Limit != nil {
+				status.Resources.Windows.MemoryLimitInBytes = int64(*spec.Windows.Resources.Memory.Limit)
+			}
+		}
+
+		// TODO: Figure out how to get RootfsSizeInBytes
+	}
+	return status
 }

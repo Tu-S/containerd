@@ -21,6 +21,7 @@ package devmapper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,7 +35,6 @@ import (
 	"github.com/containerd/containerd/snapshots/devmapper/dmsetup"
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	exec "golang.org/x/sys/execabs"
 )
@@ -44,6 +44,7 @@ type fsType string
 const (
 	metadataFileName               = "metadata.db"
 	fsTypeExt4              fsType = "ext4"
+	fsTypeExt2              fsType = "ext2"
 	fsTypeXFS               fsType = "xfs"
 	devmapperSnapshotFsType        = "containerd.io/snapshot/devmapper/fstype"
 )
@@ -76,12 +77,12 @@ func NewSnapshotter(ctx context.Context, config *Config) (*Snapshotter, error) {
 	var cleanupFn []closeFunc
 
 	if err := os.MkdirAll(config.RootPath, 0750); err != nil && !os.IsExist(err) {
-		return nil, errors.Wrapf(err, "failed to create root directory: %s", config.RootPath)
+		return nil, fmt.Errorf("failed to create root directory: %s: %w", config.RootPath, err)
 	}
 
 	store, err := storage.NewMetaStore(filepath.Join(config.RootPath, metadataFileName))
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create metastore")
+		return nil, fmt.Errorf("failed to create metastore: %w", err)
 	}
 
 	cleanupFn = append(cleanupFn, store.Close)
@@ -307,7 +308,7 @@ func (s *Snapshotter) removeDevice(ctx context.Context, key string) error {
 	deviceName := s.getDeviceName(snapID)
 	if !s.config.AsyncRemove {
 		if err := s.pool.RemoveDevice(ctx, deviceName); err != nil {
-			log.G(ctx).WithError(err).Errorf("failed to remove device")
+			log.G(ctx).WithError(err).Error("failed to remove device")
 			// Tell snapshot GC continue to collect other snapshots.
 			// Otherwise, one snapshot collection failure will stop
 			// the GC, and all snapshots won't be collected even though
@@ -318,7 +319,7 @@ func (s *Snapshotter) removeDevice(ctx context.Context, key string) error {
 		// The asynchronous cleanup will do the real device remove work.
 		log.G(ctx).WithField("device", deviceName).Debug("async remove")
 		if err := s.pool.MarkDeviceState(ctx, deviceName, Removed); err != nil {
-			log.G(ctx).WithError(err).Errorf("failed to mark device as removed")
+			log.G(ctx).WithError(err).Error("failed to mark device as removed")
 			return err
 		}
 	}
@@ -403,6 +404,7 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	if len(snap.ParentIDs) == 0 {
+		fsOptions := ""
 		deviceName := s.getDeviceName(snap.ID)
 		log.G(ctx).Debugf("creating new thin device '%s'", deviceName)
 
@@ -412,7 +414,14 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			return nil, err
 		}
 
-		if err := mkfs(ctx, s.config.FileSystemType, dmsetup.GetFullDevicePath(deviceName)); err != nil {
+		if s.config.FileSystemType == fsTypeExt4 && s.config.FsOptions == "" {
+			// Explicitly disable lazy_itable_init and lazy_journal_init in order to enable lazy initialization.
+			fsOptions = "nodiscard,lazy_itable_init=0,lazy_journal_init=0"
+		} else {
+			fsOptions = s.config.FsOptions
+		}
+		log.G(ctx).Debugf("Creating file system of type: %s with options: %s for thin device %q", s.config.FileSystemType, fsOptions, deviceName)
+		if err := mkfs(ctx, s.config.FileSystemType, fsOptions, dmsetup.GetFullDevicePath(deviceName)); err != nil {
 			status, sErr := dmsetup.Status(s.pool.poolName)
 			if sErr != nil {
 				multierror.Append(err, sErr)
@@ -448,7 +457,7 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 // mkfs creates filesystem on the given devmapper device based on type
 // specified in config.
-func mkfs(ctx context.Context, fs fsType, path string) error {
+func mkfs(ctx context.Context, fs fsType, fsOptions string, path string) error {
 	mkfsCommand := ""
 	var args []string
 
@@ -457,8 +466,14 @@ func mkfs(ctx context.Context, fs fsType, path string) error {
 		mkfsCommand = "mkfs.ext4"
 		args = []string{
 			"-E",
-			// We don't want any zeroing in advance when running mkfs on thin devices (see "man mkfs.ext4")
-			"nodiscard,lazy_itable_init=0,lazy_journal_init=0",
+			fsOptions,
+			path,
+		}
+	case fsTypeExt2:
+		mkfsCommand = "mkfs.ext2"
+		args = []string{
+			"-E",
+			fsOptions,
 			path,
 		}
 	case fsTypeXFS:
@@ -474,7 +489,7 @@ func mkfs(ctx context.Context, fs fsType, path string) error {
 	b, err := exec.Command(mkfsCommand, args...).CombinedOutput()
 	out := string(b)
 	if err != nil {
-		return errors.Wrapf(err, "%s couldn't initialize %q: %s", mkfsCommand, path, out)
+		return fmt.Errorf("%s couldn't initialize %q: %s: %w", mkfsCommand, path, out, err)
 	}
 
 	log.G(ctx).Debugf("mkfs:\n%s", out)
@@ -497,6 +512,8 @@ func (s *Snapshotter) buildMounts(ctx context.Context, snap storage.Snapshot, fi
 	if fileSystemType == "" {
 		log.G(ctx).Error("File system type cannot be empty")
 		return nil
+	} else if fileSystemType == fsTypeXFS {
+		options = append(options, "nouuid")
 	}
 	if snap.Kind != snapshots.KindActive {
 		options = append(options, "ro")
@@ -532,12 +549,12 @@ func (s *Snapshotter) withTransaction(ctx context.Context, writable bool, fn fun
 	if err != nil || !writable {
 		if terr := trans.Rollback(); terr != nil {
 			log.G(ctx).WithError(terr).Error("failed to rollback transaction")
-			result = multierror.Append(result, errors.Wrap(terr, "rollback failed"))
+			result = multierror.Append(result, fmt.Errorf("rollback failed: %w", terr))
 		}
 	} else {
 		if terr := trans.Commit(); terr != nil {
 			log.G(ctx).WithError(terr).Error("failed to commit transaction")
-			result = multierror.Append(result, errors.Wrap(terr, "commit failed"))
+			result = multierror.Append(result, fmt.Errorf("commit failed: %w", terr))
 		}
 	}
 
@@ -571,7 +588,7 @@ func (s *Snapshotter) Cleanup(ctx context.Context) error {
 		}
 		return nil
 	}); err != nil {
-		log.G(ctx).WithError(err).Errorf("failed to query devices from metastore")
+		log.G(ctx).WithError(err).Error("failed to query devices from metastore")
 		return err
 	}
 

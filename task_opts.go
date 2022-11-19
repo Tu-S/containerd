@@ -19,6 +19,7 @@ package containerd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"syscall"
 
@@ -31,7 +32,6 @@ import (
 	"github.com/containerd/containerd/runtime/v2/runc/options"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 )
 
 // NewTaskOpts allows the caller to set options on a new task
@@ -41,6 +41,15 @@ type NewTaskOpts func(context.Context, *Client, *TaskInfo) error
 func WithRootFS(mounts []mount.Mount) NewTaskOpts {
 	return func(ctx context.Context, c *Client, ti *TaskInfo) error {
 		ti.RootFS = mounts
+		return nil
+	}
+}
+
+// WithRuntimePath will force task service to use a custom path to the runtime binary
+// instead of resolving it from runtime name.
+func WithRuntimePath(absRuntimePath string) NewTaskOpts {
+	return func(ctx context.Context, client *Client, info *TaskInfo) error {
+		info.runtime = absRuntimePath
 		return nil
 	}
 }
@@ -60,8 +69,8 @@ func WithTaskCheckpoint(im Image) NewTaskOpts {
 			if m.MediaType == images.MediaTypeContainerd1Checkpoint {
 				info.Checkpoint = &types.Descriptor{
 					MediaType:   m.MediaType,
-					Size_:       m.Size,
-					Digest:      m.Digest,
+					Size:        m.Size,
+					Digest:      m.Digest.String(),
 					Annotations: m.Annotations,
 				}
 				return nil

@@ -24,7 +24,8 @@ import (
 	cio "github.com/containerd/containerd/pkg/cri/io"
 	"github.com/containerd/containerd/pkg/cri/store"
 	"github.com/containerd/containerd/pkg/cri/store/label"
-	"github.com/containerd/containerd/pkg/cri/store/truncindex"
+	"github.com/containerd/containerd/pkg/cri/store/stats"
+	"github.com/containerd/containerd/pkg/truncindex"
 
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -46,6 +47,8 @@ type Container struct {
 	// IsStopSignaledWithTimeout the default is 0, and it is set to 1 after sending
 	// the signal once to avoid repeated sending of the signal.
 	IsStopSignaledWithTimeout *uint32
+	// Stats contains (mutable) stats for the container
+	Stats *stats.ContainerStats
 }
 
 // Opts sets specific information to newly created Container.
@@ -119,7 +122,7 @@ func NewStore(labels *label.Store) *Store {
 	}
 }
 
-// Add a container into the store. Returns store.ErrAlreadyExist if the
+// Add a container into the store. Returns errdefs.ErrAlreadyExists if the
 // container already exists.
 func (s *Store) Add(c Container) error {
 	s.lock.Lock()
@@ -137,7 +140,7 @@ func (s *Store) Add(c Container) error {
 	return nil
 }
 
-// Get returns the container with specified id. Returns store.ErrNotExist
+// Get returns the container with specified id. Returns errdefs.ErrNotFound
 // if the container doesn't exist.
 func (s *Store) Get(id string) (Container, error) {
 	s.lock.RLock()
@@ -166,6 +169,30 @@ func (s *Store) List() []Container {
 	return containers
 }
 
+// UpdateContainerStats updates the container specified by ID with the
+// stats present in 'newContainerStats'. Returns errdefs.ErrNotFound
+// if the container does not exist in the store.
+func (s *Store) UpdateContainerStats(id string, newContainerStats *stats.ContainerStats) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	id, err := s.idIndex.Get(id)
+	if err != nil {
+		if err == truncindex.ErrNotExist {
+			err = errdefs.ErrNotFound
+		}
+		return err
+	}
+
+	if _, ok := s.containers[id]; !ok {
+		return errdefs.ErrNotFound
+	}
+
+	c := s.containers[id]
+	c.Stats = newContainerStats
+	s.containers[id] = c
+	return nil
+}
+
 // Delete deletes the container from store with specified id.
 func (s *Store) Delete(id string) {
 	s.lock.Lock()
@@ -176,7 +203,11 @@ func (s *Store) Delete(id string) {
 		// So we need to return if there are error.
 		return
 	}
-	s.labels.Release(s.containers[id].ProcessLabel)
-	s.idIndex.Delete(id) // nolint: errcheck
+	c := s.containers[id]
+	if c.IO != nil {
+		c.IO.Close()
+	}
+	s.labels.Release(c.ProcessLabel)
+	s.idIndex.Delete(id)
 	delete(s.containers, id)
 }

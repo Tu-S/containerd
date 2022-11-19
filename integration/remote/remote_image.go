@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
 
 	internalapi "github.com/containerd/containerd/integration/cri-api/pkg/apis"
@@ -64,7 +65,11 @@ func NewImageService(endpoint string, connectionTimeout time.Duration) (internal
 	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithContextDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
+	conn, err := grpc.DialContext(ctx, addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(dialer),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)),
+	)
 	if err != nil {
 		klog.Errorf("Connect remote image service %s failed: %v", addr, err)
 		return nil, err
@@ -106,7 +111,7 @@ func (r *ImageService) ImageStatus(image *runtimeapi.ImageSpec, opts ...grpc.Cal
 	}
 
 	if resp.Image != nil {
-		if resp.Image.Id == "" || resp.Image.Size_ == 0 {
+		if resp.Image.Id == "" || resp.Image.Size() == 0 {
 			errorMessage := fmt.Sprintf("Id or size of image %q is not set", image.Image)
 			klog.Errorf("ImageStatus failed: %s", errorMessage)
 			return nil, errors.New(errorMessage)

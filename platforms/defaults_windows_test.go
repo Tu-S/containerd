@@ -47,13 +47,39 @@ func TestDefault(t *testing.T) {
 	}
 }
 
-func TestMatchComparerMatch(t *testing.T) {
-	m := matchComparer{
-		defaults: Only(imagespec.Platform{
-			Architecture: "amd64",
-			OS:           "windows",
-		}),
-		osVersionPrefix: "10.0.17763",
+func TestDefaultMatchComparer(t *testing.T) {
+	defaultMatcher := Default()
+
+	for _, test := range []struct {
+		platform imagespec.Platform
+		match    bool
+	}{
+		{
+			platform: DefaultSpec(),
+			match:    true,
+		},
+		{
+			platform: imagespec.Platform{
+				OS:           "linux",
+				Architecture: runtime.GOARCH,
+			},
+			match: false,
+		},
+	} {
+		assert.Equal(t, test.match, defaultMatcher.Match(test.platform))
+	}
+
+}
+
+func TestMatchComparerMatch_WCOW(t *testing.T) {
+	major, minor, build := windows.RtlGetNtVersionNumbers()
+	buildStr := fmt.Sprintf("%d.%d.%d", major, minor, build)
+	m := windowsmatcher{
+		Platform:        DefaultSpec(),
+		osVersionPrefix: buildStr,
+		defaultMatcher: &matcher{
+			Platform: Normalize(DefaultSpec()),
+		},
 	}
 	for _, test := range []struct {
 		platform imagespec.Platform
@@ -67,7 +93,7 @@ func TestMatchComparerMatch(t *testing.T) {
 			platform: imagespec.Platform{
 				Architecture: "amd64",
 				OS:           "windows",
-				OSVersion:    "10.0.17763.1",
+				OSVersion:    buildStr + ".1",
 			},
 			match: true,
 		},
@@ -75,7 +101,7 @@ func TestMatchComparerMatch(t *testing.T) {
 			platform: imagespec.Platform{
 				Architecture: "amd64",
 				OS:           "windows",
-				OSVersion:    "10.0.17763.2",
+				OSVersion:    buildStr + ".2",
 			},
 			match: true,
 		},
@@ -83,7 +109,8 @@ func TestMatchComparerMatch(t *testing.T) {
 			platform: imagespec.Platform{
 				Architecture: "amd64",
 				OS:           "windows",
-				OSVersion:    "10.0.17762.1",
+				// Use an nonexistent Windows build so we don't get a match. Ws2019's build is 17763/
+				OSVersion: "10.0.17762.1",
 			},
 			match: false,
 		},
@@ -91,7 +118,8 @@ func TestMatchComparerMatch(t *testing.T) {
 			platform: imagespec.Platform{
 				Architecture: "amd64",
 				OS:           "windows",
-				OSVersion:    "10.0.17764.1",
+				// Use an nonexistent Windows build so we don't get a match. Ws2019's build is 17763/
+				OSVersion: "10.0.17764.1",
 			},
 			match: false,
 		},
@@ -99,21 +127,89 @@ func TestMatchComparerMatch(t *testing.T) {
 			platform: imagespec.Platform{
 				Architecture: "amd64",
 				OS:           "windows",
+			},
+			match: false,
+		},
+		{
+			platform: imagespec.Platform{
+				Architecture: "amd64",
+				OS:           "linux",
 			},
 			match: false,
 		},
 	} {
-		assert.Equal(t, test.match, m.Match(test.platform))
+		assert.Equal(t, test.match, m.Match(test.platform), "should match: %t, %s to %s", test.match, m.Platform, test.platform)
+	}
+}
+
+func TestMatchComparerMatch_LCOW(t *testing.T) {
+	major, minor, build := windows.RtlGetNtVersionNumbers()
+	buildStr := fmt.Sprintf("%d.%d.%d", major, minor, build)
+	m := windowsmatcher{
+		Platform: imagespec.Platform{
+			OS:           "linux",
+			Architecture: "amd64",
+		},
+		osVersionPrefix: "",
+		defaultMatcher: &matcher{
+			Platform: Normalize(imagespec.Platform{
+				OS:           "linux",
+				Architecture: "amd64",
+			},
+			),
+		},
+	}
+	for _, test := range []struct {
+		platform imagespec.Platform
+		match    bool
+	}{
+		{
+			platform: DefaultSpec(),
+			match:    false,
+		},
+		{
+			platform: imagespec.Platform{
+				Architecture: "amd64",
+				OS:           "windows",
+			},
+			match: false,
+		},
+		{
+			platform: imagespec.Platform{
+				Architecture: "amd64",
+				OS:           "windows",
+				OSVersion:    buildStr + ".2",
+			},
+			match: false,
+		},
+		{
+			platform: imagespec.Platform{
+				Architecture: "amd64",
+				OS:           "windows",
+				// Use an nonexistent Windows build so we don't get a match. Ws2019's build is 17763/
+				OSVersion: "10.0.17762.1",
+			},
+			match: false,
+		},
+		{
+			platform: imagespec.Platform{
+				Architecture: "amd64",
+				OS:           "linux",
+			},
+			match: true,
+		},
+	} {
+		assert.Equal(t, test.match, m.Match(test.platform), "should match %b, %s to %s", test.match, m.Platform, test.platform)
 	}
 }
 
 func TestMatchComparerLess(t *testing.T) {
-	m := matchComparer{
-		defaults: Only(imagespec.Platform{
-			Architecture: "amd64",
-			OS:           "windows",
-		}),
+	m := windowsmatcher{
+		Platform:        DefaultSpec(),
 		osVersionPrefix: "10.0.17763",
+		defaultMatcher: &matcher{
+			Platform: Normalize(DefaultSpec()),
+		},
 	}
 	platforms := []imagespec.Platform{
 		{

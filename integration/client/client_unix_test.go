@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -22,19 +23,15 @@ import (
 	"testing"
 
 	. "github.com/containerd/containerd"
+	"github.com/containerd/containerd/integration/images"
 	"github.com/containerd/containerd/platforms"
 )
 
-const (
-	defaultRoot    = "/var/lib/containerd-test"
-	defaultState   = "/run/containerd-test"
-	defaultAddress = "/run/containerd-test/containerd.sock"
-)
-
 var (
-	testImage    = "ghcr.io/containerd/busybox:1.32"
-	shortCommand = withProcessArgs("true")
-	longCommand  = withProcessArgs("/bin/sh", "-c", "while true; do sleep 1; done")
+	testImage             = images.Get(images.BusyBox)
+	testMultiLayeredImage = images.Get(images.VolumeCopyUp)
+	shortCommand          = withProcessArgs("true")
+	longCommand           = withProcessArgs("/bin/sh", "-c", "while true; do sleep 1; done")
 )
 
 func TestImagePullSchema1WithEmptyLayers(t *testing.T) {

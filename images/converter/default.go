@@ -48,12 +48,35 @@ func DefaultIndexConvertFunc(layerConvertFunc ConvertFunc, docker2oci bool, plat
 	return c.convert
 }
 
+// ConvertHookFunc is a callback function called during conversion of a blob.
+// orgDesc is the target descriptor to convert. newDesc is passed if conversion happens.
+type ConvertHookFunc func(ctx context.Context, cs content.Store, orgDesc ocispec.Descriptor, newDesc *ocispec.Descriptor) (*ocispec.Descriptor, error)
+
+// ConvertHooks is a configuration for hook callbacks called during blob conversion.
+type ConvertHooks struct {
+	// PostConvertHook is a callback function called for each blob after conversion is done.
+	PostConvertHook ConvertHookFunc
+}
+
+// IndexConvertFuncWithHook is the convert func used by Convert with hook functions support.
+func IndexConvertFuncWithHook(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer, hooks ConvertHooks) ConvertFunc {
+	c := &defaultConverter{
+		layerConvertFunc: layerConvertFunc,
+		docker2oci:       docker2oci,
+		platformMC:       platformMC,
+		diffIDMap:        make(map[digest.Digest]digest.Digest),
+		hooks:            hooks,
+	}
+	return c.convert
+}
+
 type defaultConverter struct {
 	layerConvertFunc ConvertFunc
 	docker2oci       bool
 	platformMC       platforms.MatchComparer
 	diffIDMap        map[digest.Digest]digest.Digest // key: old diffID, value: new diffID
 	diffIDMapMu      sync.RWMutex
+	hooks            ConvertHooks
 }
 
 // convert dispatches desc.MediaType and calls c.convert{Layer,Manifest,Index,Config}.
@@ -76,6 +99,15 @@ func (c *defaultConverter) convert(ctx context.Context, cs content.Store, desc o
 	if err != nil {
 		return nil, err
 	}
+
+	if c.hooks.PostConvertHook != nil {
+		if newDescPost, err := c.hooks.PostConvertHook(ctx, cs, desc, newDesc); err != nil {
+			return nil, err
+		} else if newDescPost != nil {
+			newDesc = newDescPost
+		}
+	}
+
 	if images.IsDockerType(desc.MediaType) {
 		if c.docker2oci {
 			if newDesc == nil {
@@ -112,12 +144,11 @@ func (c *defaultConverter) convertLayer(ctx context.Context, cs content.Store, d
 
 // convertManifest converts image manifests.
 //
-// - clears `.mediaType` if the target format is OCI
-//
+// - converts `.mediaType` if the target format is OCI
 // - records diff ID changes in c.diffIDMap
 func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
 	var (
-		manifest DualManifest
+		manifest ocispec.Manifest
 		modified bool
 	)
 	labels, err := readJSON(ctx, cs, &manifest, desc)
@@ -128,7 +159,7 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 		labels = make(map[string]string)
 	}
 	if images.IsDockerType(manifest.MediaType) && c.docker2oci {
-		manifest.MediaType = ""
+		manifest.MediaType = ConvertDockerMediaTypeToOCI(manifest.MediaType)
 		modified = true
 	}
 	var mu sync.Mutex
@@ -194,12 +225,11 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 
 // convertIndex converts image index.
 //
-// - clears `.mediaType` if the target format is OCI
-//
+// - converts `.mediaType` if the target format is OCI
 // - clears manifest entries that do not match c.platformMC
 func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
 	var (
-		index    DualIndex
+		index    ocispec.Index
 		modified bool
 	)
 	labels, err := readJSON(ctx, cs, &index, desc)
@@ -210,7 +240,7 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 		labels = make(map[string]string)
 	}
 	if images.IsDockerType(index.MediaType) && c.docker2oci {
-		index.MediaType = ""
+		index.MediaType = ConvertDockerMediaTypeToOCI(index.MediaType)
 		modified = true
 	}
 
@@ -348,25 +378,6 @@ func clearDockerV1DummyID(cfg DualConfig) (bool, error) {
 	return modified, nil
 }
 
-// ObjectWithMediaType represents an object with a MediaType field
-type ObjectWithMediaType struct {
-	// MediaType appears on Docker manifests and manifest lists.
-	// MediaType does not appear on OCI manifests and index
-	MediaType string `json:"mediaType,omitempty"`
-}
-
-// DualManifest covers Docker manifest and OCI manifest
-type DualManifest struct {
-	ocispec.Manifest
-	ObjectWithMediaType
-}
-
-// DualIndex covers Docker manifest list and OCI index
-type DualIndex struct {
-	ocispec.Index
-	ObjectWithMediaType
-}
-
 // DualConfig covers Docker config (v1.0, v1.1, v1.2) and OCI config.
 // Unmarshalled as map[string]*json.RawMessage to retain unknown fields on remarshalling.
 type DualConfig map[string]*json.RawMessage
@@ -399,6 +410,7 @@ func writeJSON(ctx context.Context, cs content.Store, x interface{}, oldDesc oci
 		return nil, err
 	}
 	if err := content.Copy(ctx, w, bytes.NewReader(b), int64(len(b)), dgst, content.WithLabels(labels)); err != nil {
+		w.Close()
 		return nil, err
 	}
 	if err := w.Close(); err != nil {

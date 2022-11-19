@@ -22,15 +22,14 @@ import (
 
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/gogo/protobuf/types"
+	"github.com/containerd/containerd/protobuf/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
 )
 
 func TestCreateDelete(t *testing.T) {
-	ctx, db, cleanup := testDB(t)
-	defer cleanup()
+	ctx, db := testDB(t)
 
 	subtests := []struct {
 		name     string
@@ -54,10 +53,22 @@ func TestCreateDelete(t *testing.T) {
 					Spec:    &types.Any{},
 				})
 				require.NoError(t, err)
+
+				db.Update(func(tx *bbolt.Tx) error {
+					ns, err := namespaces.NamespaceRequired(ctx)
+					if err != nil {
+						return err
+					}
+					bucket, err := createSnapshotterBucket(tx, ns, "testss")
+					if err != nil {
+						return err
+					}
+					return bucket.Put([]byte("key"), []byte("value"))
+				})
 			},
 			validate: func(t *testing.T, err error) {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), "still has containers")
+				assert.Contains(t, err.Error(), `still has containers, snapshots on "testss" snapshotter`)
 			},
 		},
 	}
