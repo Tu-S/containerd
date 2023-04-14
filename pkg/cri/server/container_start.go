@@ -239,6 +239,7 @@ func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io
 		}()
 		var stdoutCh, stderrCh <-chan struct{}
 		wc := cioutil.NewSerialWriteCloser(f)
+		///FQW2 сюда вместе файла подсунуть свою реализацию io.Writer
 		stdout, stdoutCh = cio.NewCRILogger(logPath, wc, cio.Stdout, c.config.MaxContainerLogLineSize)
 		// Only redirect stderr when there is no tty.
 		if !tty {
