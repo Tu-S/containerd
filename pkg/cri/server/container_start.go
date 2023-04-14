@@ -17,11 +17,12 @@
 package server
 
 import (
+	"bufio"
 	"io"
+	"net/url"
+	"os"
 	"time"
-
 	"github.com/containerd/containerd"
-	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/nri"
@@ -30,8 +31,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
-
 	cio "github.com/containerd/containerd/pkg/cri/io"
+	cioo "github.com/containerd/containerd/cio"
 	containerstore "github.com/containerd/containerd/pkg/cri/store/container"
 	sandboxstore "github.com/containerd/containerd/pkg/cri/store/sandbox"
 	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
@@ -94,8 +95,36 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 			}
 		}
 	}
+	//Code  start
+	var connectString = ""
+	var file, err1 = os.OpenFile("/home/osboxes/amqpConfig.txt", os.O_RDONLY, 0644)
+	if err1 == nil {
+		scanner := bufio.NewScanner(file)
+		scanner.Scan()
+		connectString = scanner.Text()
+	}
+	var logURI = "binary:///home/containerdTestsFiles/plugin?" + meta.LogPath
+	if connectString != "" {
+		logURI = "binary:///home/containerdTestsFiles/plugin?" + meta.LogPath + "&" + connectString
+	}
+	//"binary:///home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/plugin?/home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/logs.txt&amqp://sergey:123@localhost:5672/&/home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/backup.json&/home/sergey/Studing/Final-Qualifying-Work/ContainerdUpdate/pluginLogs.txt"
+	var ioCreator cioo.Creator
+	u, err := url.Parse(logURI)
+	if err != nil {
+		return nil, err
+	}
+	ioCreator = cioo.LogURI(u)
+	file, errr := os.OpenFile("/home/containerdTestsFiles/debug.txt", os.O_WRONLY, 0644)
+	if errr != nil {
+		return nil, errors.Wrap(err, "failed to open file for debug")
+	}
+	file.Seek(0, io.SeekEnd)
+	file.WriteString("after ioCreator \n")
+	defer file.Close()
+	//Code end
 
-	ioCreation := func(id string) (_ containerdio.IO, err error) {
+	//Here "start container" createIO
+	/*ioCreation := func(id string) (_ containerdio.IO, err error) {
 		stdoutWC, stderrWC, err := c.createContainerLoggers(meta.LogPath, config.GetTty())
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create container loggers")
@@ -103,7 +132,7 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		cntr.IO.AddOutput("log", stdoutWC, stderrWC)
 		cntr.IO.Pipe()
 		return cntr.IO, nil
-	}
+	}*/
 
 	ctrInfo, err := container.Info(ctx)
 	if err != nil {
@@ -111,7 +140,8 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 	}
 
 	taskOpts := c.taskOpts(ctrInfo.Runtime.Name)
-	task, err := container.NewTask(ctx, ioCreation, taskOpts...)
+	task, err := container.NewTask(ctx, ioCreator, taskOpts...)
+	file.WriteString("task created \n")
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create containerd task")
 	}
@@ -209,6 +239,7 @@ func (c *criService) createContainerLoggers(logPath string, tty bool) (stdout io
 		}()
 		var stdoutCh, stderrCh <-chan struct{}
 		wc := cioutil.NewSerialWriteCloser(f)
+		///FQW2 сюда вместе файла подсунуть свою реализацию io.Writer
 		stdout, stdoutCh = cio.NewCRILogger(logPath, wc, cio.Stdout, c.config.MaxContainerLogLineSize)
 		// Only redirect stderr when there is no tty.
 		if !tty {
